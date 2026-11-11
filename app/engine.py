@@ -1,6 +1,6 @@
 """MiniMax-H3-Image 生成エンジン。
 
-構成(probes/h3-image の実測に基づく、RESULTS.md 参照):
+構成(README「低 VRAM 化・高速化の方法」「調査・実測の記録」参照):
 - transformer: AdaLN 事前計算テーブル + torchao int8wo(app/pruned_image.py)。steps 2/3 は pDMD
   LoRA をマージ済みの別キャッシュ。常駐 ~19GB、1024² 1.8s / 2048² 4.1s(3-step)。
 - text_encoder: H3 動画用 prequant(nf4・51層、17GB)を流用。GPU が 2 枚あれば cuda:1 へ置き、

@@ -18,7 +18,8 @@
 4. [起動と使い方](#起動と使い方)
 5. [環境変数](#環境変数)
 6. [低 VRAM 化・高速化の方法](#低-vram-化高速化の方法)
-7. [ライセンスの注意](#ライセンスの注意)
+7. [調査・実測の記録(要点)](#調査実測の記録要点)
+8. [ライセンスの注意](#ライセンスの注意)
 
 ## 要求 VRAM
 
@@ -96,9 +97,10 @@ uv pip install --python .venv/bin/python -r requirements.txt
 ## 起動と使い方
 
 ```bash
-./run.sh                   # http://localhost:8633/
-H3IMG_PORT=8634 ./run.sh   # ポート変更
-H3IMG_STEPS=6 ./run.sh     # 既定ステップを 6 に
+./run.sh                        # http://127.0.0.1:8633/(既定はローカルのみ待ち受け)
+H3IMG_HOST=0.0.0.0 ./run.sh     # LAN に公開する場合(認証は無いので信頼できるネットワークで)
+H3IMG_PORT=8634 ./run.sh        # ポート変更
+H3IMG_STEPS=6 ./run.sh          # 既定ステップを 6 に
 ```
 
 ブラウザ UI: モード(t2i / 参照編集)、プロンプト、サイズ、steps、キャンバス、seed、参照画像(最大 16 枚)、
@@ -130,7 +132,7 @@ API(非同期ジョブ方式):
 
 | 変数 | 既定 | 内容 |
 |---|---|---|
-| `H3IMG_PORT` | 8633 | |
+| `H3IMG_HOST` / `H3IMG_PORT` | 127.0.0.1 / 8633 | 待ち受けアドレスとポート |
 | `H3IMG_STEPS` | 3 | 既定ステップ(2 / 3 / 6) |
 | `H3IMG_DEVICE` / `H3IMG_TE_DEVICE` | cuda:0 /(2 枚あれば cuda:1) | transformer / text_encoder の配置先 |
 | `H3IMG_GENERATION_AREA` | requested | 既定キャンバス(`native` = 最低 4MP) |
@@ -241,9 +243,60 @@ attention と FF の Linear 312 層(50 ブロック × 6 + token refiner 2 × 6)
   生成する前提です(派生物の再配布可否は本家ライセンスの条件に従います)。
 - 生成した画像の扱い(商用利用・公開)もモデルのライセンスの範囲内で行ってください。
 
+## 調査・実測の記録(要点)
+
+実装前に本家モデルを調査し、量子化方式の比較を実機で行いました。要点のみ記します。
+
+### モデルについて分かったこと
+
+- text_encoder(Qwen3-VL-32B)は MiniMax-H3(動画)と **14 シャード全てハッシュ一致**。どちらも
+  `hidden_states[50]` を条件付けに使う。動画用に量子化した text_encoder がそのまま使える。
+- diffusers では Modular Pipeline としてのみ提供(`MiniMaxH3ImageModularPipeline`)。本書執筆時点で
+  main ブランチのみ(0.42.1 には未収録)。
+- サンプリングは 6 step 固定(σ 列はチェックポイント内、ステップごとに専用の出力ヘッド)。CFG なし。
+- 既定では最低 4MP のキャンバスで生成して縮小するため、`min_generation_area` を指定しないと
+  1024² の要求も 2048² と同じ時間が掛かる。
+- トークン数は VAE 16× と 2×2 パッチ化で 32× 縮小: 1024² ≈ 1.1k、2048² ≈ 4.2k、4096² ≈ 16.5k。
+
+### 時間の内訳(3 step・int8wo、ロード済み)
+
+| ケース | 合計 | text_encoder | transformer | VAE decode |
+|---|---|---|---|---|
+| T2I 1024² | 2.05s(6 step) | 0.11 | 1.74 | 0.17 |
+| T2I 2048² | 7.04s(6 step) | 0.12 | 6.02 | 0.83 |
+| 編集 2048² | 11.4s(6 step) | 0.45 | 9.76 | 0.82(+encode 0.25) |
+
+時間の 7〜9 割が transformer(denoise)。text_encoder と VAE は小さく、text_encoder の軽量化は
+VRAM 目的のみ。1024² では GPU より CPU 側のカーネル発行が律速になる(CUDA Graph 化が今後の候補)。
+
+### 品質の所見(等倍目視)
+
+- テキスト生成は写真・アニメ調とも良好。参照編集は人物・キャラクターの同一性と衣装・小物をよく保つ。
+- 編集で**背景の小さな文字が崩れる**ことがある(大きな文字は保たれる)。量子化起因か本家の限界かは未切り分け。
+- int8wo の出力は bnb int8 と同一シードで構図・細部とも同等(差は量子化方式由来の微差のみ)。
+- 2 step は織り目状の微細パターンが出る。3 step で解消し 6 step に近い。
+
+### 実装上の罠(実機で踏んだもの)
+
+- `ModularPipeline._execution_device` は components の先頭の nn.Module のデバイスを返すため、
+  text_encoder を別 GPU に置くと実行デバイスがそちらになる → プロパティを上書きして固定。
+- GPU 間の受け渡しは必ずホスト経由(P2P コピーが黙って全ゼロを返す環境があった)。
+- 新しい huggingface_hub は `snapshot_download(local_files_only=True)` でも欠けたファイルを検査して
+  例外にする。一部だけ落としたスナップショットは `snapshots/<commit>` を直接参照する。
+- `accelerate.set_module_tensor_to_device` は dtype 未指定だと fp32 にキャストする(活性が fp32 化し 2 倍遅い)。
+- `init_empty_weights` はバッファ(`rope.inv_freq`)を CPU に残す → 明示的に移す。
+- torchao int8wo の素の `torch.compile(dynamic=True)` は毎回再コンパイルする。
+- steps 切替で旧 transformer をパイプライン属性と forward ラッパーのクロージャが掴んだままになり
+  二重常駐 → 参照を切ってから gc する。
+
+### 未検証
+
+- bf16 本体との品質比較(文字崩れの切り分け)、4096² 以上の VRAM・時間、複数参照(2 枚以上)の編集、
+  nf4 本体(24GB 級向け)、nvfp4 / W4A8 カーネル、CUDA Graph 化。
+
 ## 経緯
 
-diffusers-movie-server(MiniMax-H3 動画 + LTX-2.5)の第 3 バックエンドとして実装したものを、
+diffusers-movie-server(MiniMax-H3 動画 + LTX-2.5 の統合サーバ)の第 3 バックエンドとして実装したものを、
 単独で動く画像サーバとして切り出したものです。
 
 ---
