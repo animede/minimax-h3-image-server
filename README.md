@@ -140,19 +140,91 @@ API(非同期ジョブ方式):
 | `H3IMG_MAX_PIXELS` | 4096² | 1 リクエストの上限画素 |
 | `H3IMG_MAX_QUEUE` / `H3IMG_MAX_UPLOAD_MB` | 4 / 200 | キュー長 / アップロード上限 |
 
-## 軽量化の中身
+## 低 VRAM 化・高速化の方法
 
-- **AdaLN 射影の事前計算テーブル(厳密)**: 各ブロックの `Linear(2688→96768)`(計 26GB、全体の 39%)は
-  時刻埋め込みだけの関数で、このモデルはサンプリング時刻が固定(6 値 + 参照行の 1 値)。出力を先に
-  計算して `[7, 96768]` のテーブル(計 68MB)に置き換えます。元の演算と同じ device/dtype で計算するため
-  **bit 一致**(ブロック 0 で検証)。未知の時刻が来たら黙って誤らず例外にします。
-- **残り 312 層の Linear を torchao `Int8WeightOnly`(PerRow)**。bf16 シャードから 1 テンソルずつ GPU で
-  量子化し、量子化済みを `models/cache/` に保存(各 ~19GiB)。
-- **text_encoder は bnb nf4 + 51 層に刈り込み**(モデルは `hidden_states[50]` しか読まない。
-  50 層にすると最終 norm 後の値になって条件付けが変わるため 51 層)。
-- **pDMD 2-step LoRA**(rank 128)は量子化前の bf16 重みに fp32 でマージ。steps 2 / 3 は別キャッシュ。
-- 2 GPU 構成では text_encoder の出力(`hidden_states[50]`)だけをホスト経由で transformer 側へ渡します
-  (GPU 間 P2P コピーが黙って全ゼロを返す環境があったため)。
+本家は transformer 66GB(bf16)+ text_encoder 66.7GB(bf16)で、80GB GPU でも両方は載りません。
+本サーバは次の 5 つを組み合わせて、transformer 側 ~19GB・text_encoder ~17GB に収め、6 step で 1.5 倍、
+3 step で 2 倍以上速くしています。各項目の数字は実測(RTX PRO 6000、1024² / 2048²)。
+
+### 1. AdaLN 射影を「事前計算テーブル」に置き換える(VRAM −26GB、誤差ゼロ)
+
+transformer の各ブロックには、時刻埋め込み(2688 次元)から 6 種 × 3 モダリティ分の変調パラメータ
+(96768 次元)を作る線形層 `adaln_proj` があります。1 層 520MB × 50 層 = **26GB で、重み全体の 39%** を
+占めますが、入力は **時刻だけ**の関数で、トークンには依存しません。
+
+MiniMax-H3-Image はサンプリング時刻が固定です(6 step の蒸留モデルで、σ 列はチェックポイントに
+埋め込まれ、ステップごとに専用の出力ヘッドを持つ)。参照画像の行に使う時刻も 1 値です。
+つまり各ブロックの `adaln_proj` が受け取る入力は **7 通りしかない**ので、
+その 7 通りの出力を先に計算してテーブル `[7, 96768]`(計 68MB)に置き換え、生成時は行を引くだけにします。
+
+- 元の forward と同じ演算(`F.linear(silu(temb).to(bf16), W, b)`)を同じ device / dtype で実行するため
+  **出力は bit 一致**(近似ではない)。ブロック 0 で `torch.equal` により検証しています。
+- 計算量はほぼ変わらない(元々 7 行 × 50 層の小さな行列積)ので、**効果は VRAM とロード時間**。
+- 時刻集合はキャッシュごとに固定。steps 2 / 3(別の σ 列)は別テーブル・別キャッシュで、未知の時刻が
+  来たら黙って誤らず例外にします。
+- 同じ発想のコミュニティ版(rank-8 の低ランク近似、"AdaLN pruned")もありますが、時刻が固定なら
+  近似する必要はなく、厳密なテーブルで済みます。動画版 H3 で同じ構造を扱った経験から着想しました。
+
+### 2. 残りの Linear を int8 重み量子化(VRAM 40GB → 19GB、速度 1.5 倍)
+
+attention と FF の Linear 312 層(50 ブロック × 6 + token refiner 2 × 6)を torchao の
+`Int8WeightOnlyConfig(PerRow)` で量子化します。fp32 で持つべき層(入力射影・時刻埋め込み・出力ヘッド・RoPE)
+はモデル側の指定に従って量子化しません。
+
+- bf16 シャード(66GB)を **1 テンソルずつ** GPU に上げて量子化するため、bf16 を CPU/GPU に全展開しません
+  (ロード時のピークは常駐 +1.5GB、ホスト RAM は数 GB)。
+- 量子化済みを `models/cache/` に保存し、2 回目以降は 12 秒で読み込みます。
+- 単層ベンチでは bnb の LLM.int8 と同等でしたが、モデル全体では **int8wo が 1.6 倍速**
+  (1024² で bnb 3.5s → 2.4s)。bnb は外れ値分解のオーバーヘッドが積み重なります。
+- 罠: `accelerate.set_module_tensor_to_device` は dtype を渡さないと meta モデルの既定 dtype(fp32)に
+  キャストします。これで norm 等が fp32 になり活性全体が fp32 で流れ、最初は 2 倍遅くなっていました。
+
+### 3. text_encoder を nf4 + 51 層に刈り込む(66.7GB → 17GB)
+
+条件付けに使う Qwen3-VL-32B は MiniMax-H3(動画)と同一の重みで、モデルは `hidden_states[50]`
+(51 層目の出力)しか読みません。そこで config の `num_hidden_layers` を 51 にしてロードし
+(層 51〜63 と lm_head は捨てる)、bitsandbytes nf4 で量子化して保存します。
+
+- 50 層にすると最終 norm 後の値になって条件付けが変わるため、**51 層が正解**です。
+- エンコードは 1 回 0.1〜0.5 秒しか掛からないので、速度への影響はほぼありません。
+- 2 枚目の GPU があれば text_encoder だけそちらに置き、`hidden_states[50]` だけをホスト経由で
+  transformer 側へ渡します(GPU 間 P2P コピーが黙って全ゼロを返す環境があったため、直接コピーは使いません)。
+
+### 4. pDMD 2-step LoRA で 6 step → 3 step(速度 1.7 倍、品質ほぼ同等)
+
+[akhaliq/minimax-h3-image-pdmd-2step](https://huggingface.co/akhaliq/minimax-h3-image-pdmd-2step)
+(rank 128、Apache-2.0)を量子化前の bf16 重みに fp32 でマージし、shift 12 の σ 列
+(3 step: `[1.0, 0.96, 0.857, 0.0]`)で動かします。
+
+- 時間の 7〜9 割が denoise なので、ステップ数の削減が最も効きます(2048² 7.0s → 4.1s)。
+- **2 step は等倍で織り目状の微細パターン**が出て肌が平坦になるため、プレビュー用。**3 step は格子が消え、
+  髪の毛筋・ニットの編み目まで出て 6 step とほぼ同等**なのでこちらを既定にしました。
+- LoRA は AdaLN を含まないので 1. のテーブルとは独立ですが、σ 列が変わるのでテーブル(キャッシュ)は別です。
+
+### 5. 1024² は要求サイズで生成する(2〜3 倍速)
+
+本家の実装は最低 4MP(2048² 相当)のキャンバスで生成して縮小するため、1024² を頼んでも 2048² と同じ
+時間が掛かります。`generation_area: "requested"`(既定)で要求サイズのまま生成すると 1024² が 3.5s → 1.5s に
+なります。品質は良好ですが、本家推奨の画質が欲しい場合は `"native"` を指定してください。
+
+### 試して採らなかったこと
+
+| 案 | 結果 |
+|---|---|
+| sage attention | トークン数は VAE 16× + 2×2 パッチ化で 32× 縮小され、1024² で約 1.1k、2048² で約 4.2k。attention は 2048² でも全体の約 6% で効果が小さい。1024² は GPU ではなく CPU 側のカーネル発行が律速(CUDA Graph 化が次の候補) |
+| torchao int8wo + `torch.compile(dynamic=True)` | 毎回再コンパイルして使い物にならず(単層で 200〜3400ms)。静的形状での設計が必要 |
+| コミュニティの GGUF / nvfp4 / W4A8 | ComfyUI 専用形式か専用カーネルが要るため、diffusers 経路では未採用。nvfp4 は Blackwell で int8 比 +31% の報告あり(今後の候補) |
+
+### VRAM の内訳(3 step、2048² 生成時)
+
+| | GB |
+|---|---|
+| transformer int8wo(312 層) | ~17.5 |
+| AdaLN テーブル・fp32 層・norm | ~0.5 |
+| VAE(bf16) | 2.3 |
+| 生成時の活性・デコード | +1〜2 |
+| **GPU0 合計(peak)** | **~21** |
+| text_encoder nf4(別 GPU 可) | ~17 |
 
 ## ライセンスの注意
 
@@ -183,5 +255,11 @@ Standalone server + browser UI for MiniMax-H3-Image (33B text-to-image / referen
 projections (39% of the weights) are replaced by an exact precomputed table (the sampling timesteps are
 fixed), the remaining linears are torchao int8 weight-only, and the pDMD 2-step LoRA is merged for a 3-step
 default. Measured on an RTX PRO 6000: 1.8s @1024², 4.1s @2048², 6.7s for a 2048² reference edit.
-`scripts/prepare_models.py` downloads the model and the LoRA and builds the nf4 text encoder.
+How: (1) the AdaLN projections only depend on the (fixed) sampling timesteps, so their outputs are
+precomputed into a 68MB table with bit-exact results (−26GB); (2) the remaining 312 linears are int8
+weight-only, quantized shard-by-shard without materializing bf16 (−21GB, 1.6× faster than bnb LLM.int8);
+(3) the Qwen3-VL-32B text encoder is nf4 and truncated to 51 layers (the model reads hidden_states[50]);
+(4) the pDMD LoRA makes 3 steps look like 6 (1.7×); (5) generating at the requested size instead of the
+4MP minimum canvas makes 1024² 2–3× faster. `scripts/prepare_models.py` downloads the model and the LoRA
+and builds the nf4 text encoder.
 **Code: MIT. Model weights and outputs: MiniMax-H3-Image Community License (see the model card).**
