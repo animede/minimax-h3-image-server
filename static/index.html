@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniMax-H3-Image</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2026; --line:#2c3038; --fg:#e6e6e6; --muted:#9aa0a8; --acc:#4f8cff; --err:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui, "Noto Sans JP", sans-serif; }
+  .wrap { display:grid; grid-template-columns: 400px 1fr; gap:16px; padding:16px; min-height:100vh; }
+  @media (max-width: 900px) { .wrap { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  h1 { font-size:16px; margin:0 0 10px; }
+  h2 { font-size:14px; margin:14px 0 6px; color:var(--muted); }
+  label { display:block; margin:8px 0 4px; color:var(--muted); font-size:12px; }
+  input, select, textarea, button { width:100%; background:#0f1115; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 9px; font:inherit; }
+  textarea { min-height:120px; resize:vertical; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .row3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; }
+  button.primary { background:var(--acc); border-color:var(--acc); color:#fff; cursor:pointer; margin-top:12px; }
+  button.primary:disabled { opacity:.5; cursor:default; }
+  button.small { width:auto; padding:4px 10px; cursor:pointer; }
+  .muted { color:var(--muted); font-size:12px; }
+  .err { color:var(--err); white-space:pre-wrap; }
+  .bar { height:8px; background:#0f1115; border-radius:4px; overflow:hidden; margin-top:8px; }
+  .bar > div { height:100%; background:var(--acc); width:0; transition:width .3s; }
+  .result img { max-width:100%; border-radius:8px; border:1px solid var(--line); }
+  .refs { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+  .refs .ref { position:relative; width:88px; height:88px; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  .refs .ref img { width:100%; height:100%; object-fit:cover; }
+  .refs .ref span { position:absolute; left:4px; top:2px; font-size:11px; background:rgba(0,0,0,.6); padding:0 4px; border-radius:3px; }
+  .refs .ref button { position:absolute; right:2px; top:2px; width:auto; padding:0 5px; font-size:11px; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  td, th { border-bottom:1px solid var(--line); padding:5px 6px; text-align:left; }
+  .thumb { width:64px; height:64px; object-fit:cover; border-radius:4px; }
+  .status { font-size:12px; color:var(--muted); margin-top:8px; }
+  .actions { display:flex; gap:10px; align-items:center; margin-top:8px; }
+  .small-link { color:#9ec1ff; font-size:12px; }
+  button.danger { background:#3a1f22; border-color:#5a2b31; color:#ffb3b3; }
+  td.ops { white-space:nowrap; } td.ops a { margin-right:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section class="panel">
+    <h1>MiniMax-H3-Image <span class="muted" id="hdr-status">…</span></h1>
+    <label>モード</label>
+    <select id="mode"><option value="t2i">テキストから生成(t2i)</option><option value="edit">参照画像で編集(edit)</option></select>
+    <label>プロンプト <span class="muted">(編集では &lt;Picture 1&gt; … で参照。長く具体的に)</span></label>
+    <textarea id="prompt" placeholder="A close-up photograph of ..."></textarea>
+    <div id="refbox" hidden>
+      <label>参照画像(最大 16 枚)</label>
+      <input type="file" id="reffiles" accept="image/*" multiple>
+      <div class="refs" id="refs"></div>
+    </div>
+    <div class="row3">
+      <div><label>幅</label><input id="width" type="text" inputmode="numeric" value="2048"></div>
+      <div><label>高さ</label><input id="height" type="text" inputmode="numeric" value="2048"></div>
+      <div><label>サイズ候補</label><select id="sizes"><option value="">—</option><option value="1024x1024">1024²</option><option value="2048x2048">2048²(推奨)</option><option value="4096x4096">4096²</option><option value="2688x1536">2688×1536(16:9)</option><option value="1536x2688">1536×2688(9:16)</option></select></div>
+    </div>
+    <div class="row3">
+      <div><label>ステップ</label><select id="steps"><option value="">サーバ既定</option><option value="3">3(pDMD・高速・推奨)</option><option value="6">6(チェックポイント既定)</option><option value="2">2(pDMD・プレビュー)</option></select></div>
+      <div><label>生成キャンバス</label><select id="area"><option value="">サーバ既定</option><option value="requested">要求サイズ(高速)</option><option value="native">4MP 以上(推奨品質)</option></select></div>
+      <div><label>seed(空=ランダム)</label><input id="seed" type="text" inputmode="numeric" placeholder="random"></div>
+    </div>
+    <button class="primary" id="go">生成</button>
+    <div class="bar"><div id="bar"></div></div>
+    <div class="status" id="status"></div>
+    <div class="err" id="err"></div>
+    <h2>サーバ</h2>
+    <div class="muted" id="server-info">—</div>
+  </section>
+  <section class="panel">
+    <h2>結果</h2>
+    <div class="result" id="result"><span class="muted">まだ生成していません</span></div>
+    <h2>履歴 <button class="small" id="refresh">更新</button></h2>
+    <table><thead><tr><th></th><th>モード</th><th>サイズ</th><th>steps</th><th>状態</th><th>時間</th><th>seed</th><th>操作</th></tr></thead><tbody id="jobs"></tbody></table>
+  </section>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let refs = []; // {id, name, url}
+let currentJob = null;
+
+$("mode").addEventListener("change", () => { $("refbox").hidden = $("mode").value !== "edit"; });
+$("sizes").addEventListener("change", () => {
+  const v = $("sizes").value; if (!v) return;
+  const [w, h] = v.split("x"); $("width").value = w; $("height").value = h;
+});
+$("reffiles").addEventListener("change", async (ev) => {
+  for (const f of ev.target.files) {
+    if (refs.length >= 16) break;
+    const fd = new FormData(); fd.append("file", f);
+    const r = await fetch("/api/assets", { method: "POST", body: fd });
+    if (!r.ok) { $("err").textContent = "アップロード失敗: " + (await r.text()); continue; }
+    const a = await r.json();
+    refs.push({ id: a.id, name: f.name, url: URL.createObjectURL(f) });
+  }
+  ev.target.value = ""; renderRefs();
+});
+function renderRefs() {
+  const box = $("refs"); box.textContent = "";
+  refs.forEach((r, i) => {
+    const d = document.createElement("div"); d.className = "ref";
+    const img = document.createElement("img"); img.src = r.url;
+    const tag = document.createElement("span"); tag.textContent = "Picture " + (i + 1);
+    const rm = document.createElement("button"); rm.textContent = "×"; rm.onclick = () => { refs.splice(i, 1); renderRefs(); };
+    d.append(img, tag, rm); box.appendChild(d);
+  });
+}
+function intField(id, label, def) {
+  // type=number だと「2048 」のような末尾スペース付きを空扱いにして区別できないため、
+  // テキスト欄で受けて前後の空白を落としてから解釈する(2026-11-11 の実事例)。
+  const el = $(id);
+  const raw = el.value.trim();
+  if (raw === "") throw new Error(label + " を入力してください(例: " + def + ")");
+  if (!/^\d+$/.test(raw)) throw new Error(label + " は整数で指定してください(入力値: \"" + el.value + "\")");
+  const v = parseInt(raw, 10);
+  if (v < 256 || v > 8192) throw new Error(label + " は 256〜8192 の範囲で指定してください(32 の倍数に丸められます)");
+  el.value = String(v);
+  return v;
+}
+$("go").addEventListener("click", async () => {
+  $("err").textContent = "";
+  let width, height;
+  try { width = intField("width", "幅", 2048); height = intField("height", "高さ", 2048); }
+  catch (e) { $("err").textContent = e.message; return; }
+  if (!$("prompt").value.trim()) { $("err").textContent = "プロンプトを入力してください"; return; }
+  if ($("mode").value === "edit" && refs.length === 0) { $("err").textContent = "編集には参照画像が 1 枚以上必要です"; return; }
+  const body = {
+    mode: $("mode").value, prompt: $("prompt").value,
+    width, height,
+    conditions: $("mode").value === "edit" ? refs.map((r) => ({ asset_id: r.id })) : [],
+  };
+  if ($("steps").value) body.steps = parseInt($("steps").value, 10);
+  if ($("area").value) body.generation_area = $("area").value;
+  const seedRaw = $("seed").value.trim();
+  if (seedRaw !== "") {
+    if (!/^-?\d+$/.test(seedRaw)) { $("err").textContent = "seed は整数で指定してください(空=ランダム)"; return; }
+    body.seed = parseInt(seedRaw, 10);
+  }
+  const r = await fetch("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!r.ok) { $("err").textContent = "受理されませんでした: " + (await r.text()); return; }
+  currentJob = (await r.json()).id; $("go").disabled = true; poll();
+});
+async function poll() {
+  if (!currentJob) return;
+  const r = await fetch("/api/jobs/" + currentJob); const j = await r.json();
+  $("bar").style.width = Math.round(j.progress * 100) + "%";
+  $("status").textContent = j.status + (j.status === "running" ? " (" + Math.round(j.progress * 100) + "%)" : "") +
+    (j.generation_seconds ? " · " + j.generation_seconds + "s · peak " + j.peak_vram_gb + "GB · steps " + j.steps_used : "");
+  if (j.status === "completed") {
+    showResult(j); currentJob = null; $("go").disabled = false; loadJobs(); return;
+  }
+  if (j.status === "failed" || j.status === "interrupted") { $("err").textContent = j.status + ": " + (j.error || ""); currentJob = null; $("go").disabled = false; loadJobs(); return; }
+  setTimeout(poll, 700);
+}
+function fileNameOf(url) { return url.split("/").pop().split("?")[0]; }
+function downloadLink(url, cls) {
+  const a = document.createElement("a"); a.href = url; a.download = fileNameOf(url); a.textContent = "ダウンロード";
+  a.className = cls || "small-link"; return a;
+}
+async function deleteOutput(url) {
+  const name = fileNameOf(url);
+  if (!window.confirm(name + " を削除します。元に戻せません。よろしいですか?")) return false;
+  const r = await fetch("/api/outputs/" + encodeURIComponent(name), { method: "DELETE" });
+  if (!r.ok) { $("err").textContent = "削除に失敗しました: " + (await r.text()); return false; }
+  return true;
+}
+function showResult(j) {
+  $("result").innerHTML = "";
+  const img = document.createElement("img"); img.src = j.image_url + "?t=" + Date.now(); $("result").appendChild(img);
+  const row = document.createElement("div"); row.className = "actions";
+  const open = document.createElement("a"); open.href = j.image_url; open.target = "_blank"; open.textContent = "元サイズで開く"; open.className = "small-link";
+  const del = document.createElement("button"); del.className = "small danger"; del.textContent = "削除";
+  del.onclick = async () => { if (await deleteOutput(j.image_url)) { $("result").innerHTML = '<span class="muted">削除しました</span>'; loadJobs(); } };
+  row.append(open, downloadLink(j.image_url), del); $("result").appendChild(row);
+}
+async function loadJobs() {
+  const r = await fetch("/api/jobs?limit=30"); const jobs = await r.json();
+  const tb = $("jobs"); tb.textContent = "";
+  for (const j of jobs) {
+    const tr = document.createElement("tr");
+    const th = document.createElement("td");
+    if (j.image_url) { const im = document.createElement("img"); im.className = "thumb"; im.src = j.image_url; im.style.cursor = "pointer"; im.onclick = () => window.open(j.image_url, "_blank"); th.appendChild(im); }
+    const cells = [j.request.mode, j.request.width + "×" + j.request.height, j.steps_used ?? (j.request.steps ?? "既定"), j.status, j.generation_seconds ? j.generation_seconds + "s" : "", j.request.seed ?? ""];
+    tr.appendChild(th); for (const c of cells) { const td = document.createElement("td"); td.textContent = c; tr.appendChild(td); }
+    const ops = document.createElement("td"); ops.className = "ops";
+    if (j.image_url) {
+      ops.appendChild(downloadLink(j.image_url));
+      const del = document.createElement("button"); del.className = "small danger"; del.textContent = "削除";
+      del.onclick = async () => {
+        if (!(await deleteOutput(j.image_url))) return;
+        const shown = document.querySelector("#result img");
+        if (shown && shown.src.split("?")[0].endsWith(j.image_url)) $("result").innerHTML = '<span class="muted">削除しました</span>';
+        loadJobs();
+      };
+      ops.appendChild(del);
+    } else if (j.status === "completed") { ops.textContent = "削除済み"; ops.className = "ops muted"; }
+    tr.appendChild(ops);
+    tb.appendChild(tr);
+  }
+}
+async function loadStatus() {
+  try {
+    const r = await fetch("/api/status"); const s = await r.json();
+    $("hdr-status").textContent = s.loaded ? "ロード済 (steps " + s.steps + ")" : "未ロード(初回生成時にロード、約 30 秒)";
+    $("server-info").textContent = "既定 steps " + s.default_steps + " / キャンバス " + s.default_generation_area + " / device " + s.engine.device + " / TE " + s.engine.te_device;
+  } catch (e) { $("hdr-status").textContent = "status 取得失敗"; }
+}
+$("refresh").addEventListener("click", loadJobs);
+loadStatus(); loadJobs(); setInterval(loadStatus, 10000);
+</script>
+</body>
+</html>

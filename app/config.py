@@ -1,0 +1,74 @@
+"""MiniMax-H3-Image サーバの設定(環境変数 H3IMG_*)。
+
+モデル類の置き場はリポジトリ直下の `models/`(`H3IMG_MODELS_DIR` で変更可):
+  models/te/     量子化済み text_encoder(Qwen3-VL-32B、bnb nf4・51 層)。`scripts/prepare_models.py` が作る
+  models/lora/   pDMD 2-step LoRA(steps 2 / 3 で使う)
+  models/cache/  量子化済み transformer キャッシュ(各 ~19GiB、初回生成時に自動構築)
+いずれも symlink でよい(他のインストールと共有する場合)。本家モデルの bf16 シャードは
+HF キャッシュ(`~/.cache/huggingface/hub`)に置く(`H3IMG_MODEL_DIR` で直接指定も可)。
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+STEP_PRESETS = {
+    # steps → (sample_sigmas の上書き(None=チェックポイント既定の 6 step)、キャッシュ名接尾辞、LoRA 要否)
+    6: (None, "", False),
+    # pDMD 2-step LoRA(akhaliq/minimax-h3-image-pdmd-2step)。shift 12、σ = 12b/(1+11b)。
+    3: ([1.0, 0.96, 0.8571428571428571, 0.0], "_pdmd3", True),
+    2: ([1.0, 0.9230769230769231, 0.0], "_pdmd2", True),
+}
+
+LORA_FILENAME = "minimax_h3_image_pdmd_2step_lora.safetensors"
+
+
+def _env(name: str, default: str) -> str:
+    return os.environ.get(name, default).strip() or default
+
+
+@dataclass
+class Settings:
+    port: int = int(_env("H3IMG_PORT", "8633"))
+    model_id: str = _env("H3IMG_MODEL_ID", "MiniMaxAI/MiniMax-H3-Image")
+    # ローカルのスナップショットを直接指す場合(未指定なら HF キャッシュの最新スナップショット)
+    model_dir: str = _env("H3IMG_MODEL_DIR", "")
+    models_dir: Path = Path(_env("H3IMG_MODELS_DIR", str(BASE_DIR / "models")))
+    device: str = _env("H3IMG_DEVICE", "cuda:0")
+    # 既定: GPU が 2 枚以上あれば TE を cuda:1 に置く(engine 側で解決)
+    te_device: str = _env("H3IMG_TE_DEVICE", "")
+    # 既定のステップ数(2 / 3 / 6)。リクエストごとに上書き可(transformer の差し替えが走る)
+    default_steps: int = int(_env("H3IMG_STEPS", "3"))
+    # 起動時にロードする(1)か、初回リクエストまで遅延する(0、既定)
+    preload: bool = _env("H3IMG_PRELOAD", "0") == "1"
+    output_dir: Path = Path(_env("H3IMG_OUTPUT_DIR", str(BASE_DIR / "outputs")))
+    input_dir: Path = Path(_env("H3IMG_INPUT_DIR", str(BASE_DIR / "inputs")))
+    max_upload_mb: int = int(_env("H3IMG_MAX_UPLOAD_MB", "200"))
+    max_queue: int = int(_env("H3IMG_MAX_QUEUE", "4"))
+    # 既定の生成キャンバス: "native" = 最低 4MP で生成して縮小(モデル推奨、1024² でも 2048² 相当の時間)、
+    # "requested" = 要求サイズで生成(1024² が 2〜3 倍速い。品質は良好)
+    default_generation_area: str = _env("H3IMG_GENERATION_AREA", "requested")
+    max_pixels: int = int(_env("H3IMG_MAX_PIXELS", str(4096 * 4096)))
+    cache_tags: dict = field(default_factory=lambda: {k: v[1] for k, v in STEP_PRESETS.items()})
+    # 個別上書き(未指定なら models_dir 配下。__post_init__ で解決)
+    te_dir: Path = field(default_factory=lambda: Path())
+    lora_path: Path = field(default_factory=lambda: Path())
+    cache_dir: Path = field(default_factory=lambda: Path())
+
+    def __post_init__(self) -> None:
+        self.te_dir = Path(_env("H3IMG_TE_DIR", str(self.models_dir / "te")))
+        self.lora_path = Path(_env("H3IMG_LORA_PATH", str(self.models_dir / "lora" / LORA_FILENAME)))
+        self.cache_dir = Path(_env("H3IMG_CACHE_DIR", str(self.models_dir / "cache")))
+        if self.default_steps not in STEP_PRESETS:
+            raise ValueError(f"H3IMG_STEPS は {sorted(STEP_PRESETS)} のいずれかです: {self.default_steps}")
+        if self.default_generation_area not in ("native", "requested"):
+            raise ValueError("H3IMG_GENERATION_AREA は native / requested のいずれかです")
+        for d in (self.cache_dir, self.output_dir, self.input_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+
+settings = Settings()
