@@ -80,7 +80,7 @@ class Engine:
                 self._repo = str(snap)
                 return self._repo
         raise RuntimeError(
-            f"{self.s.model_id} のスナップショットが見つかりません。probes/h3-image/download.py 相当で "
+            f"{self.s.model_id} のスナップショットが見つかりません。scripts/prepare_models.py を実行して "
             "transformer_diffusers / vae_diffusers / scheduler / tokenizer / processor / *.json を取得してください")
 
     def _build_pipeline(self):
