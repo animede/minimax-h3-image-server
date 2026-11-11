@@ -9,6 +9,7 @@ API(非同期ジョブ方式。diffusers-movie-server のバックエンド版�
   GET  /api/jobs/{id}        ジョブ状態
   DELETE /api/jobs/{id}
   DELETE /api/outputs/{filename}  生成物の削除(履歴のジョブは image_url が外れる)
+  POST /api/prompts/enhance  {prompt, mode, conditions?} 公式 PE ルールでのプロンプト拡張(LLM 必要)
   POST /api/interrupt        {job_id?} 実行中ジョブの中断
   POST /api/admin/unload     VRAM 解放(プロセス温存、resident 切替用)。実行中は 409
   POST /api/admin/load       {steps?} 明示ロード
@@ -30,8 +31,11 @@ from PIL import Image
 
 from .config import STEP_PRESETS, settings
 from .engine import Engine
+from .enhance import EnhanceConnectionError, EnhanceError, EnhanceUnavailable, PromptEnhancer
 from .jobs import JobManager
-from .schemas import AssetResponse, GenerateRequest, JobResponse
+from pydantic import BaseModel
+
+from .schemas import AssetResponse, ConditionInput, GenerateRequest, JobResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("h3image")
@@ -42,6 +46,7 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 app = FastAPI(title="MiniMax-H3-Image server", version="0.1.0")
 engine = Engine(settings)
 manager = JobManager(settings, engine)
+enhancer = PromptEnhancer(settings)
 
 app.mount("/outputs", StaticFiles(directory=str(settings.output_dir)), name="outputs")
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
@@ -61,7 +66,7 @@ def index():
 @app.get("/api/health")
 def health():
     return {"status": "ok", "model": settings.model_id, "loaded": engine.loaded,
-            "steps": engine.loaded_steps, "prompt_enhancer": False}
+            "steps": engine.loaded_steps, "prompt_enhancer": enhancer.available}
 
 
 @app.get("/api/status")
@@ -149,6 +154,33 @@ def delete_output(filename: str):
     for jid in cleared:
         manager.jobs[jid].image_url = None
     return {"result": "deleted", "filename": filename, "jobs_cleared": cleared}
+
+
+class EnhanceRequest(BaseModel):
+    prompt: str
+    mode: str = "t2i"                       # t2i | edit(それ以外は t2i 扱い)
+    conditions: list[ConditionInput] = []   # edit: 参照画像(アップロード順 = <Picture N>)
+    aspect_ratio: Optional[str] = None      # edit: "W:H" を指定すると固定、省略で adaptive
+
+
+@app.post("/api/prompts/enhance")
+def enhance_prompt(req: EnhanceRequest):
+    """公式 PE ルールで短い指示を英語の詳細プロンプト + 推奨比率へ(OpenAI 互換 LLM を使用)。"""
+    mode = "edit" if req.mode == "edit" else "t2i"
+    paths = []
+    for c in req.conditions:
+        p = manager._asset_path(c.asset_id)
+        if p is None:
+            raise HTTPException(status_code=400, detail=f"アセットが見つかりません: {c.asset_id}")
+        paths.append(p)
+    try:
+        return enhancer.enhance(req.prompt, mode, paths, req.aspect_ratio)
+    except EnhanceUnavailable as exc:
+        raise HTTPException(status_code=501, detail=str(exc))
+    except EnhanceConnectionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except EnhanceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/interrupt")

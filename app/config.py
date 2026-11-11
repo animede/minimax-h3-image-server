@@ -27,6 +27,21 @@ STEP_PRESETS = {
 LORA_FILENAME = "minimax_h3_image_pdmd_2step_lora.safetensors"
 
 
+def _load_dotenv(path: Path) -> None:
+    """`.env`(KEY=VALUE、# コメント)を環境変数へ(既存の環境変数が優先)。"""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_dotenv(BASE_DIR / ".env")
+
+
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, default).strip() or default
 
@@ -53,6 +68,11 @@ class Settings:
     # "requested" = 要求サイズで生成(1024² が 2〜3 倍速い。品質は良好)
     default_generation_area: str = _env("H3IMG_GENERATION_AREA", "requested")
     max_pixels: int = int(_env("H3IMG_MAX_PIXELS", str(4096 * 4096)))
+    # プロンプト拡張に使う OpenAI 互換 LLM(未設定なら拡張は 501)
+    llm_base_url: str = _env("H3IMG_LLM_BASE_URL", "")
+    llm_model: str = _env("H3IMG_LLM_MODEL", "")
+    llm_api_key: str = _env("H3IMG_LLM_API_KEY", "")
+    llm_timeout_s: float = float(_env("H3IMG_LLM_TIMEOUT_S", "180"))
     cache_tags: dict = field(default_factory=lambda: {k: v[1] for k, v in STEP_PRESETS.items()})
     # 個別上書き(未指定なら models_dir 配下。__post_init__ で解決)
     te_dir: Path = field(default_factory=lambda: Path())

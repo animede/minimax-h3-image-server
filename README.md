@@ -18,8 +18,9 @@
 4. [起動と使い方](#起動と使い方)
 5. [環境変数](#環境変数)
 6. [低 VRAM 化・高速化の方法](#低-vram-化高速化の方法)
-7. [調査・実測の記録(要点)](#調査実測の記録要点)
-8. [ライセンスの注意](#ライセンスの注意)
+7. [プロンプトの書き方(本家の方針)](#プロンプトの書き方本家の方針)
+8. [調査・実測の記録(要点)](#調査実測の記録要点)
+9. [ライセンスの注意](#ライセンスの注意)
 
 ## 要求 VRAM
 
@@ -128,6 +129,37 @@ API(非同期ジョブ方式):
 - `width` / `height` は 32 の倍数に丸められます。上限は `H3IMG_MAX_PIXELS`(既定 4096²)。
 - `steps` をリクエストで変えると transformer を差し替えます(キャッシュ読込 ~12s)。
 
+## プロンプトの書き方(本家の方針)
+
+本家は「**画像全体の詳細な英語の記述**」を期待します。公式 API は短い指示を `H3-Image-Context-IR` で拡張してから
+生成しており、その拡張ルールはプロンプト拡張モデル [MiniMaxAI/MiniMax-H3-Image-PE](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image-PE)
+同梱の `prompt/t2i/task_prompt.txt` / `prompt/edit/task_prompt.txt` に書かれています。要点:
+
+**テキストから生成(t2i)**
+- 「写真・情景」か「情報設計物(ポスター・カード・UI・図表)」かをまず決める。後者は見出し・ラベル・凡例・単位まで
+  入った完成した構成として書く。
+- 固有名詞・文字・数・順序・左右上下・スタイルは一字一句保持。文字を出すなら「どこに書かれているか」まで。
+- 言葉を増やすのではなく「見て確認できる内容」を増やす。dramatic / cinematic のようなムード語は具体的に見える手がかりに。
+- 人物の向きはカメラ基準で明示(正面 / 背面 / 左向き / 右向き / 斜め)。手の接触・持ち物は「どちらの手が何に」まで。
+- 主要人物の数は要求どおり。出力は 1 段落の流れる英文。
+
+**参照画像で編集(edit)**
+- 参照画像はアップロード順に `<Picture 1>`, `<Picture 2>` … と書く。
+- 本家の手本は 3 部構成: `<Picture 1>` の要素を `<Subject N>` として定義 →「保持するもの」と「変えるもの」を明示 →
+  完成後の画像全体を記述。保持する要素は見えている事実に忠実に、変更部分だけ新しい見た目を具体的に。
+- 例(本家 `examples/prompt.edit.txt` の冒頭):
+  > The dark, warmly lit podcast studio photograph of two hosts behind a wooden desk in <Picture 1> is <Subject 1>.
+  > <Subject 1> is mostly preserved: the large "EP. 47" title in the top right corner, … Take the over-ear headphones
+  > off the man on the left … and have both hosts fist-bump directly above the "MONEY TALKS" desk sign …
+
+**プロンプト拡張(本サーバの機能)**
+UI の「拡張」ボタン / `POST /api/prompts/enhance` は、PE 同梱の公式ルールをそのまま system prompt として
+OpenAI 互換の LLM(例: llama.cpp server の gemma 系)に送り、短い日本語の指示を公式ルール準拠の英語プロンプトと
+推奨アスペクト比に変換します。PE モデル本体(FP4 約 19GB)を載せずに済む代わりに、精度は本家 PE に劣る可能性があります。
+編集モードでは参照画像も LLM に渡す(マルチモーダル対応の LLM が必要)。設定は `H3IMG_LLM_BASE_URL` /
+`H3IMG_LLM_MODEL` / `H3IMG_LLM_API_KEY`(環境変数または `.env`)。公式ルールの文書は初回に PE リポジトリから
+`models/prompts/` へ取得します。
+
 ## 環境変数
 
 | 変数 | 既定 | 内容 |
@@ -141,6 +173,8 @@ API(非同期ジョブ方式):
 | `H3IMG_TE_DIR` / `H3IMG_LORA_PATH` / `H3IMG_CACHE_DIR` / `H3IMG_MODEL_DIR` | 上記配下 / HF キャッシュ | 個別の上書き |
 | `H3IMG_MAX_PIXELS` | 4096² | 1 リクエストの上限画素 |
 | `H3IMG_MAX_QUEUE` / `H3IMG_MAX_UPLOAD_MB` | 4 / 200 | キュー長 / アップロード上限 |
+| `H3IMG_LLM_BASE_URL` / `H3IMG_LLM_MODEL` / `H3IMG_LLM_API_KEY` | (未設定=拡張無効) | プロンプト拡張に使う OpenAI 互換 LLM(`.env` にも書ける) |
+| `H3IMG_LLM_TIMEOUT_S` | 180 | LLM のタイムアウト |
 
 ## 低 VRAM 化・高速化の方法
 

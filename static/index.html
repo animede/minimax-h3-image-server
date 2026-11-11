@@ -47,8 +47,15 @@
     <h1>MiniMax-H3-Image <span class="muted" id="hdr-status">…</span></h1>
     <label>モード</label>
     <select id="mode"><option value="t2i">テキストから生成(t2i)</option><option value="edit">参照画像で編集(edit)</option></select>
-    <label>プロンプト <span class="muted">(編集では &lt;Picture 1&gt; … で参照。長く具体的に)</span></label>
+    <label>プロンプト <span class="muted">(英語の詳細な記述が前提。短い日本語は「拡張」で変換)</span></label>
     <textarea id="prompt" placeholder="A close-up photograph of ..."></textarea>
+    <div class="actions" style="margin-top:6px">
+      <button class="small" id="enhance" title="公式 PE ルールで英語の詳細プロンプトへ変換(LLM が必要)">拡張(公式ルール → 英語)</button>
+      <span class="muted" id="enhance-status"></span>
+    </div>
+    <div class="muted" id="prompt-tip" style="margin-top:6px">
+      <b>書き方:</b> 画像全体を 1 段落で具体的に。文字・固有名詞・数・左右は正確に。人物の向きはカメラ基準(正面/背面/左向き…)で。
+    </div>
     <div id="refbox" hidden>
       <label>参照画像(最大 16 枚)</label>
       <input type="file" id="reffiles" accept="image/*" multiple>
@@ -83,7 +90,30 @@ const $ = (id) => document.getElementById(id);
 let refs = []; // {id, name, url}
 let currentJob = null;
 
-$("mode").addEventListener("change", () => { $("refbox").hidden = $("mode").value !== "edit"; });
+const TIPS = {
+  t2i: "<b>書き方:</b> 画像全体を 1 段落で具体的に。文字・固有名詞・数・左右は正確に。人物の向きはカメラ基準(正面/背面/左向き…)で。ムード語より見える手がかりを。",
+  edit: "<b>書き方:</b> 参照はアップロード順に &lt;Picture 1&gt; &lt;Picture 2&gt;…。「&lt;Picture 1&gt; の〜は保持」→「〜を変える」→「完成後の画像」の順に。保持する要素は見えている事実に忠実に、変更部分だけ具体的に。",
+};
+function updateTip() { $("prompt-tip").innerHTML = TIPS[$("mode").value] || TIPS.t2i; }
+$("mode").addEventListener("change", () => { $("refbox").hidden = $("mode").value !== "edit"; updateTip(); });
+$("enhance").addEventListener("click", async () => {
+  const raw = $("prompt").value.trim();
+  if (!raw) { $("err").textContent = "拡張するプロンプト(短い指示でも可)を入力してください"; return; }
+  $("err").textContent = ""; $("enhance").disabled = true; $("enhance-status").textContent = "LLM で変換中…";
+  try {
+    const body = { prompt: raw, mode: $("mode").value, conditions: $("mode").value === "edit" ? refs.map((r) => ({ asset_id: r.id })) : [] };
+    const r = await fetch("/api/prompts/enhance", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) { $("err").textContent = "拡張に失敗しました: " + (await r.text()); return; }
+    const j = await r.json();
+    $("prompt").value = j.prompt;
+    let msg = "変換しました(推奨比率 " + j.aspect_ratio + ")";
+    if (j.suggested_width && j.suggested_height) {
+      const apply = window.confirm("推奨比率 " + j.aspect_ratio + " に合わせてサイズを " + j.suggested_width + "×" + j.suggested_height + " にしますか?");
+      if (apply) { $("width").value = j.suggested_width; $("height").value = j.suggested_height; msg += " → サイズ適用"; }
+    }
+    $("enhance-status").textContent = msg;
+  } finally { $("enhance").disabled = false; }
+});
 $("sizes").addEventListener("change", () => {
   const v = $("sizes").value; if (!v) return;
   const [w, h] = v.split("x"); $("width").value = w; $("height").value = h;
@@ -206,10 +236,12 @@ async function loadStatus() {
   try {
     const r = await fetch("/api/status"); const s = await r.json();
     $("hdr-status").textContent = s.loaded ? "ロード済 (steps " + s.steps + ")" : "未ロード(初回生成時にロード、約 30 秒)";
+    $("enhance").disabled = !s.prompt_enhancer; $("enhance").title = s.prompt_enhancer ? "公式 PE ルールで英語の詳細プロンプトへ変換" : "LLM 未設定(H3IMG_LLM_BASE_URL / H3IMG_LLM_MODEL)";
     $("server-info").textContent = "既定 steps " + s.default_steps + " / キャンバス " + s.default_generation_area + " / device " + s.engine.device + " / TE " + s.engine.te_device;
   } catch (e) { $("hdr-status").textContent = "status 取得失敗"; }
 }
 $("refresh").addEventListener("click", loadJobs);
+updateTip();
 loadStatus(); loadJobs(); setInterval(loadStatus, 10000);
 </script>
 </body>

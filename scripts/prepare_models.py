@@ -125,6 +125,21 @@ def build_text_encoder(delete_source: bool) -> None:
                 log(f"TE ソースを削除: {repo.repo_path}")
 
 
+def download_pe_prompts() -> None:
+    """プロンプト拡張用の公式ルール文書(PE リポジトリの prompt/*、小さなテキスト)を models/prompts/ へ。"""
+    from huggingface_hub import hf_hub_download
+    from app.enhance import PE_FILES, PE_REPO
+
+    dst_root = settings.models_dir / "prompts"
+    for rel in PE_FILES.values():
+        dst = dst_root / rel
+        if dst.exists():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(hf_hub_download(PE_REPO, rel), dst)
+        log(f"PE prompt: {rel}")
+
+
 def build_cache(steps_list: list[int]) -> None:
     import torch
     from app.engine import Engine
@@ -162,6 +177,7 @@ def main() -> None:
     if not a.skip_download:
         download_image_model()
     download_lora()
+    download_pe_prompts()
     build_text_encoder(a.delete_te_source)
     if a.build_cache:
         build_cache(a.build_cache)
