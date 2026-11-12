@@ -3,8 +3,8 @@
 [MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)(33B、静止画生成 +
 最大 16 枚参照の編集)を **約 21GB の VRAM で、1024² を 1.8 秒・2048² を 4.1 秒**で動かす
 単独の画像サーバ + ブラウザ UI です。**W4A8 量子化 + text_encoder の層ストリーミングで 16GB 1 枚でも動き、さらに transformer の
-ブロックストリーミングで 8GB 級でも動きます**(実使用 4.2GB、1024² 2.6〜3.1 秒・2048² 4.2 秒・2048² 級の編集 7.7 秒。
-出力は常駐時とピクセル一致)。diffusers(main)ベース、コードは MIT ライセンス。
+ブロックストリーミングで 8GB 級でも動きます**(VRAM 実使用 4.2GB・ホスト RAM 約 29GB、1024² 1.8 秒・2048² 3.5 秒・
+2048² 級の編集 6.3 秒。出力は常駐時とピクセル一致)。diffusers(main)ベース、コードは MIT ライセンス。
 
 - 本家の bf16 は transformer 66GB + text_encoder 66.7GB で 80GB GPU にも同時に載りませんが、
   本サーバは **AdaLN 射影の事前計算テーブル(bit 一致・近似なし)+ int8 重み量子化 + nf4 text_encoder**で
@@ -46,8 +46,8 @@
 |---|---|---|---|
 | `48gb` | int8wo、TE 常駐(最高速) | ≥ 40GB(TE が別 GPU なら ≥ 22.5GB) | 37〜38.4GB |
 | `32gb` | W4A8、TE 常駐 | ≥ 31.5GB(別 GPU なら ≥ 14.5GB) | 28.7〜30.2GB |
-| `16gb` | W4A8 + TE 層ストリーミング + VAE スワップ | ≥ 14.5GB | 12.5〜13.1GB |
-| `8gb` | 上記 + transformer ブロックストリーミング | それ未満 | 2.4〜2.9GB(プロセス実使用 4.2GB)、ホスト RAM 約 52GB |
+| `16gb` | W4A8 + TE 層ストリーミング + VAE スワップ | ≥ 14.5GB | 12.5〜13.0GB(ホスト RAM 約 19GB) |
+| `8gb` | 上記 + transformer ブロックストリーミング | それ未満 | 2.4〜2.9GB(プロセス実使用 4.2GB)、ホスト RAM 約 29GB |
 
 - GPU が 2 枚あれば TE は既定で 2 枚目に置きます(`H3IMG_TE_GPU`)。使う GPU は `H3IMG_GPU=1` のように番号で指定。
 - 生成中に CUDA OOM が起きたら(ロード後に他のプロセスが VRAM を取った等)、**一段下のプロファイルへ自動で下げて
@@ -78,10 +78,10 @@ W4A8 構成(`ck-w4a8`、3 step、TE も同じ GPU):
 
 | ケース | 32GB 構成(TE 常駐) | 16GB 構成(TE ストリーミング + VAE スワップ) | 8GB 構成(+ ブロックストリーミング) |
 |---|---|---|---|
-| T2I 1024² | 0.7s | 2.6s | 2.6〜3.1s |
-| T2I 2048² | 2.8s | 4.1s | 4.2s |
+| T2I 1024² | 0.7s | 1.2s | 1.8s |
+| T2I 2048² | 2.8s | 3.4s | 3.5s |
 | 参照編集 1024×1536(参照 1 枚) | — | 5.0s | — |
-| 参照編集 1664×2496(参照 1 枚) | 5.6s | 7.3s | 7.7s |
+| 参照編集 1664×2496(参照 1 枚) | 5.6s | 6.0〜6.3s | 6.1〜6.5s |
 | T2I 2048² 6 step | — | 6.1s(24GB 相当で測定) | — |
 | peak VRAM(torch) | 28.7〜30.2GB | 12.5〜13.1GB | 2.4〜2.9GB(プロセス実使用 max 4.2GB) |
 
@@ -161,7 +161,7 @@ H3IMG_GPU=0 H3IMG_TE_GPU=1 ./run.sh
 # 予算を指定: 96GB の GPU でも 16GB 級の構成(W4A8 + TE ストリーミング)で動かす
 H3IMG_VRAM_GB=16 ./run.sh
 
-# 8GB 級の構成を強制(ホスト RAM を約 52GB 使う)
+# 8GB 級の構成を強制(ホスト RAM を約 29GB 使う)
 H3IMG_VRAM_GB=8 ./run.sh
 
 # 量子化だけ明示(予算より優先): W4A8 で TE は常駐(32GB 級の構成)
@@ -184,8 +184,8 @@ H3IMG_VRAM_FALLBACK=0 ./run.sh
 |---|---|---|---|---|---|
 | `48gb` | int8wo | 常駐 | 常駐 | 40GB(TE が別 GPU なら 22.5GB) | 1.8s / 4.1s |
 | `32gb` | W4A8 | 常駐 | 常駐 | 31.5GB(別 GPU なら 14.5GB) | 0.7s / 2.8s |
-| `16gb` | W4A8 | ストリーミング | 常駐 | 14.5GB | 2.6s / 4.1s |
-| `8gb` | W4A8 | ストリーミング | ストリーミング | 5GB(実使用 4.2GB) | 2.6〜3.1s / 4.2s |
+| `16gb` | W4A8 | ストリーミング | 常駐 | 14.5GB | 1.2s / 3.4s |
+| `8gb` | W4A8 | ストリーミング | ストリーミング | 5GB(実使用 4.2GB) | 1.8s / 3.5s |
 
 選ばれたプロファイルは起動ログ(`VRAM profile: ...`)、`/api/status` の `engine.profile`、ジョブ結果の `profile` で
 確認できます。`auto` の各項目は予算から決まり、明示した項目はそれより優先されます。
@@ -322,7 +322,7 @@ VRAM を減らす手段は「小さくする」「GPU に置かない」「使�
 その結果 8GB 構成でも 16GB 構成と同じ速度で、出力はピクセル単位で一致します。
 
 どの手段をどこまで使うかは VRAM 予算([起動例](#起動例gpuvram-予算量子化の指定))から自動で決めます。
-「置かない / 使う瞬間だけ置く」ものはホスト RAM に残るので、8GB 構成ではプロセスのホスト RAM 使用量が約 51GB 使います。
+「置かない / 使う瞬間だけ置く」ものはホスト RAM に残るので、8GB 構成ではプロセスのホスト RAM 使用量が約 29GB になります。
 
 ### 1. AdaLN 射影を「事前計算テーブル」に置き換える(VRAM −26GB、誤差ゼロ)
 
@@ -410,15 +410,15 @@ GPU へ往復させます。bitsandbytes の nf4 パラメータは `.to()` の�
 - **VAE(2.3GB)は encode / decode の間だけ GPU に置く**: 参照画像付きの編集では TE が画像トークン分の活性を
   使うため、VAE が常駐していると 16GB 級では TE のエンコード中に OOM しました(実測)。往復は 0.1〜0.2s。
 
-エンコードは 0.12s → 1.3s(+1.1s / 生成)ですが、プロンプトは 1 回しか通らないので、生成全体では 16GB 構成
-でも int8wo(48GB 構成)と同程度の速度です。プロセスのホスト RAM 使用量は生成後 32〜35GB です。
+プロンプトは 1 回しか通らないので、層を流すコストは生成全体で 1 秒未満です。16GB 構成の 2048² は 3.4 秒で、
+int8wo(48GB 構成)の 4.1 秒より速くなります(W4A8 の GEMM が速いため)。プロセスのホスト RAM 使用量は約 19GB。
 
 ### 8. transformer の 50 ブロックを先読みしながら流す(常駐 11GB → 1GB、8GB 級向け)
 
 `H3IMG_TRANSFORMER_STREAM=1`(`8gb` プロファイルで自動)。W4A8 化した transformer_blocks(各 ~0.2GB)を
 pinned ホスト RAM に置き、forward hook でブロック i の計算中に i+1 を別の CUDA stream でコピーします。
-GPU に残るのは token refiner・入出力射影などの ~1GB。コピーが計算に隠れるので、**速度は 16GB 構成と同じ**
-(2048² 4.2s)、出力は常駐時と**ピクセル一致**です。プロセスのホスト RAM 使用量は約 51GB です(下記)。
+GPU に残るのは token refiner・入出力射影などの ~1GB。コピーが計算に隠れるので、**速度は 16GB 構成とほぼ同じ**
+(2048² 3.5s)、出力は常駐時と**ピクセル一致**です。プロセスのホスト RAM 使用量は約 29GB です(下記)。
 
 - 重みは書き換わらないので GPU → CPU の書き戻しはしません。pre hook で GPU へコピーした tensor を
   `param.data` に差し、post hook で pinned のマスターへ戻すだけです。
@@ -427,20 +427,35 @@ GPU に残るのは token refiner・入出力射影などの ~1GB。コピーが
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`(run.sh で既定)で reserved の膨張を抑えます
   (プロセス実使用 6.8GB → 4.2GB)。
 
-### ホスト RAM の実測
+### ホスト RAM: 切り上げないピン留めと、書き戻さない流し方
 
-GPU から外したものはホスト RAM に移ります。2048² を 1 枚生成した後のプロセスの RSS:
+GPU から外したものはホスト RAM に置きます。最初の実装は 8gb 構成で **51GB** も使っていました。原因は 3 つで、
+いずれも直してあります(`app/pruned_image.py` の `pin_module` / `stream_layers`)。
 
-| プロファイル | 生成後 | ロード中の最大 |
+1. **`Tensor.pin_memory()` の切り上げ**: PyTorch のピン留めアロケータは確保サイズを切り上げます(実体 24.6GB に
+   対して 33.1GB)。層・ブロックごとに 1 本の匿名メモリを確保し、`cudaHostRegister` でその場でピン留めして、
+   各テンソルをそのビューに差し替えるようにしました。切り上げは起きません。登録は unload の前に解除します。
+2. **text_encoder を `.to()` で往復させていた**: `mod.to("cpu")` で戻すと毎回新しい(ピン留めされていない)CPU
+   テンソルができ、1 回目以降は転送も遅くなっていました。transformer と同じく「ピン留めした原本を保持し、GPU 側は
+   捨てるだけ」の方式にしました。bitsandbytes の量子化状態(absmax / code)も一緒に流します。
+3. **safetensors の mmap が残っていた**: text_encoder の重みを原本へ移すと mmap は参照を失って解放されます
+   (埋め込み表も複製して切り離す)。量子化キャッシュも `torch.load(mmap=True)` で読み、全体をホストへ展開しません。
+
+2048² を生成した後のプロセスのメモリ(RSS):
+
+| プロファイル | 改善前 | 改善後 |
 |---|---|---|
-| `48gb` | 2.1GB | 21GB(量子化キャッシュを一度ホストに読むため) |
-| `16gb` | 32〜35GB | 39.5GB |
-| `8gb` | 50〜51GB | 51.7GB |
+| `48gb` | 2.1GB | 2.2GB |
+| `16gb` | 32〜35GB | **18.8GB** |
+| `8gb` | 50〜51GB | **29.2GB** |
 
-`8gb` の内訳は、ピン留めメモリ 33.1GB(実体 24.6GB。PyTorch の `pin_memory()` が確保サイズを切り上げる)、
-text_encoder の safetensors の mmap 12.2GB(ページキャッシュで OS が回収できる)、その他 5.9GB。
-`cudaHostRegister` でその場でピン留めすれば切り上げは起きないため、改善の余地があります(未実装)。
-**8GB / 16GB 構成で使う場合は、ホスト RAM 64GB 以上を目安にしてください。**
+ロード中に増えるのは mmap のページキャッシュ(OS が回収できる)だけで、匿名メモリの最大は生成後と同じです。
+**8gb 構成はホスト RAM 32GB でぎりぎり、48GB 以上なら余裕があります。16gb 構成は 32GB で動きます。**
+副次効果として、text_encoder の転送がピン留めのまま行われるようになり、16gb / 8gb 構成が速くなりました
+(1024² 2.6s → 1.2s / 1.8s、2048² 4.1〜4.2s → 3.4〜3.5s)。
+
+また、ロード時に PyTorch のアロケータが予約できる量を「VRAM 予算 − 1GB」に制限しています
+(`torch.cuda.set_per_process_memory_fraction`)。ストリーミングで解放が遅れても、予算を超えて VRAM を抱え込みません。
 
 ### 試して採らなかったこと
 
@@ -552,11 +567,12 @@ the actual free memory; on a CUDA OOM during generation it steps down one profil
 kernels, ~11GB, faster GEMM than int8) and the 51 text-encoder layers are streamed one at a time from pinned
 host RAM (resident ~0.3GB after dropping the unused lm_head and keeping the embedding table on CPU;
 bit-exact output), and the VAE is moved to the GPU only for encode/decode, so the whole model runs on a
-**single 32GB GPU (peak ~29GB) or a single 16GB GPU (peak 12.5–13.1GB)** at 2.6s @1024² / 4.1s @2048² /
-7.3s for a 1664×2496 reference edit. With `H3IMG_TRANSFORMER_STREAM=1` the 50 transformer blocks are also
-prefetched from pinned host RAM on a side stream (pixel-identical output, same speed), bringing the process
-footprint down to **4.2GB, i.e. an 8GB GPU** (all verified on a 96GB GPU with free memory capped at
-15.5GB / 7.3GB; real 8–32GB cards not tested yet).
+**single 32GB GPU (peak ~29GB) or a single 16GB GPU (peak 12.5–13.0GB, host RAM ~19GB)** at 1.2s @1024² /
+3.4s @2048² / 6.0s for a 1664×2496 reference edit. With `H3IMG_TRANSFORMER_STREAM=1` the 50 transformer blocks are
+also prefetched from pinned host RAM on a side stream (pixel-identical output, about the same speed), bringing the
+process footprint down to **4.2GB of VRAM, i.e. an 8GB GPU, with ~29GB of host RAM**. Host memory is pinned in place
+with cudaHostRegister (no allocator round-up) and weights are never copied back from the GPU (all verified on a 96GB
+GPU with free memory capped at 15.5GB / 7.3GB; real 8–32GB cards not tested yet).
 How: (1) the AdaLN projections only depend on the (fixed) sampling timesteps, so their outputs are
 precomputed into a 68MB table with bit-exact results (−26GB); (2) the remaining 312 linears are int8
 weight-only, quantized shard-by-shard without materializing bf16 (−21GB, 1.6× faster than bnb LLM.int8);

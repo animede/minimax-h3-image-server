@@ -197,35 +197,137 @@ class CKW4A8Linear(nn.Linear):
         return y.reshape(*shape[:-1], y.shape[-1])
 
 
-def install_block_streaming(tr, device: torch.device) -> None:
-    """transformer_blocks(50 個、ck-w4a8 で各 ~0.2GB)を pinned CPU に置き、forward hook で 1 ブロックずつ
-    GPU へ流す(12GB 級以下向け)。次のブロックは別 stream で先読みする。
+# --- ホスト側にピン留めした原本から GPU へ流す仕組み(TE の層・transformer ブロック・VAE で共通) ---------------
+#
+# 1 モジュール(層・ブロック)の全テンソルを 1 本の匿名メモリにまとめ、cudaHostRegister でその場でピン留めする。
+# `Tensor.pin_memory()` は PyTorch のピン留めアロケータが確保サイズを切り上げるため、実体より大きく取られる
+# (実測: 8gb 構成で実体 24.6GB に対し 33.1GB)。cudaHostRegister なら切り上げは起きない。
+# 登録したバッファは owner ごとに覚えておき、解放前に release_pinned(owner) で登録を解除する。
 
-    重みは書き換わらないので GPU → CPU の書き戻しはしない: pinned CPU のマスターを保持し、pre hook で
-    GPU へコピーした tensor を `param.data` に差し、post hook でマスターに戻すだけ(GPU 側は解放)。
-    先読みは copy stream 上で行うので、GPU tensor に `record_stream(計算 stream)` を付けて、計算が終わる前に
+_PINNED: dict[str, list[torch.Tensor]] = {}
+_ALIGN = 256
+
+
+def release_pinned(owner: str) -> float:
+    """owner のピン留めを解除して参照を手放す。解除した量(GB)を返す。"""
+    bufs = _PINNED.pop(owner, [])
+    cudart = torch.cuda.cudart()
+    for b in bufs:
+        cudart.cudaHostUnregister(b.data_ptr())
+    return sum(b.numel() for b in bufs) / 2**30
+
+
+def pinned_gb() -> dict[str, float]:
+    return {k: round(sum(b.numel() for b in v) / 2**30, 2) for k, v in _PINNED.items()}
+
+
+def _quant_state_slots(qs, out: list) -> None:
+    """bitsandbytes の QuantState が持つテンソル(absmax / code / offset、二重量子化なら state2 も)。"""
+    for attr in ("absmax", "code", "offset"):
+        if isinstance(getattr(qs, attr, None), torch.Tensor):
+            out.append((qs, attr))
+    if getattr(qs, "state2", None) is not None:
+        _quant_state_slots(qs.state2, out)
+
+
+def _slots(module: nn.Module) -> list:
+    """モジュールが forward で使うテンソルの置き場所 (obj, attr) の一覧。attr == "data" はパラメータ/バッファ本体。"""
+    out, seen = [], set()
+    for t in list(module.parameters()) + list(module.buffers()):
+        if id(t) in seen:
+            continue
+        seen.add(id(t))
+        out.append((t, "data"))
+        qs = getattr(t, "quant_state", None)  # bnb の Params4bit
+        if qs is not None:
+            _quant_state_slots(qs, out)
+    return out
+
+
+def _get(slot) -> torch.Tensor:
+    obj, attr = slot
+    return obj.data if attr == "data" else getattr(obj, attr)
+
+
+def _set(slot, value: torch.Tensor) -> None:
+    obj, attr = slot
+    if attr == "data":
+        obj.data = value
+    else:
+        setattr(obj, attr, value)
+
+
+def pin_module(module: nn.Module, owner: str) -> list:
+    """module の全テンソルを 1 本のピン留めバッファへ移し、各スロットをそのビューに差し替える。
+    戻り値は [(slot, pinned_view)](GPU へ流すときの原本)。元の CPU/GPU テンソルは手放される。"""
+    slots = _slots(module)
+    sizes = [_get(sl).numel() * _get(sl).element_size() for sl in slots]
+    offsets, total = [], 0
+    for nb in sizes:
+        offsets.append(total)
+        total += (nb + _ALIGN - 1) // _ALIGN * _ALIGN
+    buf = torch.empty(max(total, _ALIGN), dtype=torch.uint8)
+    err = torch.cuda.cudart().cudaHostRegister(buf.data_ptr(), buf.numel(), 0)
+    if int(err) != 0:
+        raise RuntimeError(f"cudaHostRegister に失敗しました({err})")
+    _PINNED.setdefault(owner, []).append(buf)
+    masters = []
+    for sl, off, nb in zip(slots, offsets, sizes):
+        src = _get(sl)
+        view = buf[off:off + nb].view(src.dtype).view(src.shape)
+        view.copy_(src)
+        _set(sl, view)
+        masters.append((sl, view))
+    return masters
+
+
+def to_device(masters: list, device: torch.device, stream_to_record: torch.cuda.Stream | None = None) -> None:
+    """原本から GPU へコピーしてスロットに差す(non_blocking)。stream_to_record があれば record_stream する。"""
+    for sl, pinned in masters:
+        g = pinned.to(device, non_blocking=True)
+        if stream_to_record is not None:
+            g.record_stream(stream_to_record)
+        _set(sl, g)
+
+
+def to_host(masters: list) -> None:
+    """スロットをピン留めの原本へ戻す(重みは不変なので GPU からの書き戻しはしない)。"""
+    for sl, pinned in masters:
+        _set(sl, pinned)
+
+
+def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = True) -> None:
+    """layers(順に呼ばれる層の列)をピン留めした原本に置き、forward hook で 1 つずつ GPU へ流す。
+    層 i の計算中に i+1 を別 stream で先読みする。
+
+    先読みは copy stream 上で行うので、GPU 側テンソルに `record_stream(計算 stream)` を付け、計算が終わる前に
     アロケータがその領域を次の先読みに再利用しないようにする(これを欠くと出力が黒画像になる、実測)。
     """
-    blocks = tr.transformer_blocks
-    masters: list[list[tuple[torch.Tensor, torch.Tensor]]] = []  # block ごとの [(param_or_buffer, pinned)]
-    for b in blocks:
-        b.to("cpu")
-        entries = []
-        for t in list(b.parameters()) + list(b.buffers()):
-            t.data = t.data.pin_memory()
-            entries.append((t, t.data))
-        masters.append(entries)
-    n = len(blocks)
+    masters = []
+    for layer in layers:
+        layer.to("cpu")
+        masters.append(pin_module(layer, owner))
+    n = len(masters)
+    if not prefetch:
+        # 先読みなし: 計算と同じ stream でコピーする。解放はストリーム順序で守られるので record_stream が要らず、
+        # アロケータの予約が膨らまない(1 回しか通らない TE 向け)。
+        def pre_sync(mod, args, kwargs, _m=None):
+            to_device(_m, device)
+
+        def post_sync(mod, args, out, _m=None):
+            to_host(_m)
+
+        for layer, m in zip(layers, masters):
+            layer.register_forward_pre_hook(functools.partial(pre_sync, _m=m), with_kwargs=True)
+            layer.register_forward_hook(functools.partial(post_sync, _m=m))
+        return
     copy_stream = torch.cuda.Stream(device)
-    events: list[torch.cuda.Event | None] = [None] * n
     compute = torch.cuda.current_stream(device)
+    events: list = [None] * n
 
     def prefetch(i: int) -> None:
         with torch.cuda.stream(copy_stream):
-            for t, pinned in masters[i]:
-                g = pinned.to(device, non_blocking=True)
-                g.record_stream(compute)
-                t.data = g
+            to_device(masters[i], device, compute)
             ev = torch.cuda.Event()
             ev.record(copy_stream)
             events[i] = ev
@@ -242,13 +344,17 @@ def install_block_streaming(tr, device: torch.device) -> None:
 
     def make_post(i: int):
         def post(mod, args, out):
-            for t, pinned in masters[i]:
-                t.data = pinned  # GPU 側は record_stream により計算完了後に解放される
+            to_host(masters[i])
         return post
 
-    for i, b in enumerate(blocks):
-        b.register_forward_pre_hook(make_pre(i), with_kwargs=True)
-        b.register_forward_hook(make_post(i))
+    for i, layer in enumerate(layers):
+        layer.register_forward_pre_hook(make_pre(i), with_kwargs=True)
+        layer.register_forward_hook(make_post(i))
+
+
+def install_block_streaming(tr, device: torch.device) -> None:
+    """transformer_blocks(50 個、ck-w4a8 で各 ~0.2GB)を先読みしながら流す(8gb 構成)。"""
+    stream_layers(tr.transformer_blocks, device, owner="transformer")
 
 
 def _replace_quant_targets_with_ck_shells(tr) -> None:
@@ -407,7 +513,8 @@ def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = Fals
     config = Cls.load_config(str(cache_dir))
     with init_empty_weights():
         tr = Cls.from_config(config)
-    sd = torch.load(str(cache_dir / STATE_FILENAME), map_location="cpu", weights_only=False)
+    # mmap で読む: 量子化キャッシュ全体(11〜19GiB)をホスト RAM へ展開せず、必要なページだけ読む
+    sd = torch.load(str(cache_dir / STATE_FILENAME), map_location="cpu", weights_only=False, mmap=True)
     hidden = config["hidden_size"]
     if any(k.endswith(".qdata") for k in sd):
         _replace_quant_targets_with_ck_shells(tr)

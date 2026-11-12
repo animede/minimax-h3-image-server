@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from . import pruned_image
 from .config import STEP_PRESETS, Settings
@@ -107,6 +108,7 @@ class Engine:
             "te_loaded": self.te is not None,
             "te_streamed": self.te_streamed,
             "transformer_streamed": self.transformer_streamed,
+            "host_pinned_gb": pruned_image.pinned_gb(),
             "vram_alloc_gb": round(torch.cuda.memory_allocated(self.device) / 2**30, 2),
         }
 
@@ -194,10 +196,24 @@ class Engine:
         if split:
             te_stream = False  # TE が別 GPU ならストリーミングは不要(そちらに常駐)
         prof = Profile(chosen.name, quant, te_stream, tr_stream, chosen.need_same, chosen.need_split)
+        self._cap_allocator(budget)
         logger.info("VRAM profile: %s (budget %.1fGB = min(requested %.1f, free %.1f), TE %s) -> quant=%s te_stream=%s "
                     "transformer_stream=%s", prof.name, budget, requested, free_gb,
                     "split" if split else "same GPU", prof.quant, prof.te_stream, prof.transformer_stream)
         return prof
+
+    def _cap_allocator(self, budget_gb: float) -> None:
+        """PyTorch のキャッシングアロケータが予約できる量を予算 - 1GB(CUDA コンテキスト分)に制限する。
+
+        先読み(record_stream)は解放が計算の完了まで遅れるので、上限が無いとアロケータは空いている VRAM を
+        全部予約してしまう(実測: 空き 7.3GB の GPU で割り当て 3.1GB に対しプロセスが 7.3GB を占有)。
+        上限に達するとアロケータはキャッシュを解放してから再確保するので、同じ GPU の他のプロセスを圧迫しない。
+        予算が GPU 全体と同じ(既定の auto で空いている大きい GPU)ならほぼ無制限のまま。
+        """
+        total_gb = torch.cuda.get_device_properties(self.device).total_memory / 2**30
+        frac = min(1.0, max(0.05, (budget_gb - 1.0) / total_gb))
+        torch.cuda.set_per_process_memory_fraction(frac, self.device)
+        logger.info("allocator cap: %.1fGB (budget %.1fGB)", frac * total_gb, budget_gb)
 
     def _transformer_stream_enabled(self) -> bool:
         return self.profile.transformer_stream
@@ -206,41 +222,31 @@ class Engine:
         return self.profile.te_stream
 
     def _stream_text_encoder(self, te) -> None:
-        """decoder 51 層を pinned CPU に退避し、forward hook で 1 層ずつ GPU へ往復させる。
+        """decoder 51 層をピン留めした原本(cudaHostRegister)に置き、1 層ずつ GPU へ流す。
 
-        bnb nf4 の Params4bit は `.to()` の往復で量子化状態を保つ(hidden_states[50] が全 GPU 常駐時と
-        bit 一致することを実測済み)。GPU に残すのは vision tower / norm / RoPE の ~0.3GB。
+        bnb nf4 の量子化状態(QuantState の absmax / code)も一緒に流す。GPU からの書き戻しはしない。
+        lm_head(1.45GB)は hidden_states[50] しか読まないので捨て、embed_tokens(bf16 1.45GB)は CPU で引く。
+        TE は device_map="cpu" で読んでいるので、ここで原本をピン留めバッファへ移すと safetensors の mmap は
+        参照を失って解放される(埋め込みも複製して mmap から切り離す)。
         """
         dev = self.device
         lm = te.model.language_model
-        layers = lm.layers
         t0 = time.time()
-        # decoder 層・埋め込み以外(vision tower、最終 norm、RoPE)だけ GPU へ
         te.model.visual.to(dev)
         lm.norm.to(dev)
         lm.rotary_emb.to(dev)
-        for layer in layers:
-            layer.to("cpu")
-            for p in layer.parameters():
-                p.data = p.data.pin_memory()
-
-        def pre(mod, args, kwargs):
-            mod.to(dev, non_blocking=True)
-
-        def post(mod, args, out):
-            mod.to("cpu", non_blocking=True)
-
-        for layer in layers:
-            layer.register_forward_pre_hook(pre, with_kwargs=True)
-            layer.register_forward_hook(post)
-        # lm_head(1.45GB)は hidden_states[50] しか読まないので不要。embed_tokens(bf16 1.45GB)は
-        # 参照結果だけを GPU へ送れば済むので CPU に置く(どちらも出力は変わらない)。
+        # 先読みはしない: TE は 1 回しか通らず、先読みの効果は実測で 0.1s 程度(誤差の範囲)。先読みすると
+        # record_stream で解放が遅れ、アロケータの予約が膨らむ(8gb 構成で 4.2GB → 6.6GB)。
+        pruned_image.stream_layers(lm.layers, dev, owner="te", prefetch=False)
         te.lm_head = _UnusedHead()
-        lm.embed_tokens = _CpuEmbedding(lm.embed_tokens.to("cpu"), dev)
+        emb = lm.embed_tokens
+        emb.weight = nn.Parameter(emb.weight.detach().to("cpu").clone(), requires_grad=False)
+        lm.embed_tokens = _CpuEmbedding(emb, dev)
         torch.cuda.empty_cache()
         self.te_streamed = True
-        logger.info("text_encoder decoder layers streamed from pinned host (%d layers, %.1fs, resident=%.2fGB)",
-                    len(layers), time.time() - t0, torch.cuda.memory_allocated(dev) / 2**30)
+        logger.info("text_encoder decoder layers streamed from pinned host (%d layers, %.1fs, resident=%.2fGB, "
+                    "pinned=%s)", len(lm.layers), time.time() - t0,
+                    torch.cuda.memory_allocated(dev) / 2**30, pruned_image.pinned_gb())
 
     def _route_text_encoder(self, te) -> None:
         """te.model.forward を包み、入力を TE 側 GPU へ、hidden_states[50] だけをホスト経由で返す。"""
@@ -277,23 +283,23 @@ class Engine:
         return vae
 
     def _swap_vae(self, vae) -> None:
-        """VAE(2.3GB)を pinned CPU に置き、encode / decode の間だけ GPU へ置く(TE ストリーミング時)。
+        """VAE をピン留めした原本に置き、encode / decode の間だけ GPU へ置く(TE ストリーミング時)。
 
         参照画像付きの編集では TE が画像トークン分の活性を使うため、16GB 級では VAE が常駐していると
-        TE のエンコード中に OOM する(実測)。往復は 2.3GB で 0.1〜0.2s。
+        TE のエンコード中に OOM する(実測)。往復は 1.4GB で 0.1〜0.2s。コピーは計算と同じ stream で行うので、
+        戻した後の領域の再利用はストリーム順序で守られる。
         """
         dev = self.device
         vae.to("cpu")
-        for p in vae.parameters():
-            p.data = p.data.pin_memory()
+        masters = pruned_image.pin_module(vae, owner="vae")
 
         def wrap(fn):
             def inner(*args, **kwargs):
-                vae.to(dev, non_blocking=True)
+                pruned_image.to_device(masters, dev)
                 try:
                     return fn(*args, **kwargs)
                 finally:
-                    vae.to("cpu", non_blocking=True)
+                    pruned_image.to_host(masters)
                     torch.cuda.empty_cache()
             return inner
 
@@ -384,8 +390,10 @@ class Engine:
             pass
         del old
         gc.collect()
+        unpinned = pruned_image.release_pinned("transformer")
         torch.cuda.empty_cache()
-        logger.info("transformer dropped, alloc=%.2fGB", torch.cuda.memory_allocated(self.device) / 2**30)
+        logger.info("transformer dropped, alloc=%.2fGB, unpinned=%.1fGB",
+                    torch.cuda.memory_allocated(self.device) / 2**30, unpinned)
 
     def unload(self) -> dict:
         with self.lock:
@@ -397,6 +405,10 @@ class Engine:
         self._drop_transformer()
         self.te = self.vae = self.pipe = None
         self.te_streamed = self.transformer_streamed = False
+        import gc as _gc
+        _gc.collect()
+        for owner in ("te", "vae", "transformer"):
+            pruned_image.release_pinned(owner)
         self.profile = None
         import gc
         gc.collect()
