@@ -401,7 +401,7 @@ pDMD LoRA は fp32 でマージしてから量子化します(2 と同じ)。キ
 
 `H3IMG_TE_STREAM=1`(`16gb` 以下のプロファイルで自動)。nf4 の decoder 51 層を最初から CPU に読み(GPU に載せて
 から退避すると、ロードの時点で 16GB を超える)、pinned ホスト RAM から forward hook で 1 層(~0.3GB)ずつ
-GPU へ往復させます。bitsandbytes の nf4 パラメータは `.to()` の往復で量子化状態を保つので、
+GPU へ流します。bitsandbytes の nf4 は量子化状態(absmax / code)も一緒に原本から流すので、
 **hidden_states[50] は全 GPU 常駐時と bit 一致**(実測、最大誤差 0.0)。あわせて:
 
 - **lm_head(1.45GB)を捨てる**: H3-Image は hidden_states[50] しか読まないので使われていません。
