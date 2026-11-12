@@ -54,3 +54,4 @@ class JobResponse(BaseModel):
     generation_seconds: float | None = None
     peak_vram_gb: float | None = None
     steps_used: int | None = None
+    profile: str | None = None

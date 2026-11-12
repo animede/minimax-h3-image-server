@@ -53,20 +53,23 @@ class Settings:
     # ローカルのスナップショットを直接指す場合(未指定なら HF キャッシュの最新スナップショット)
     model_dir: str = _env("H3IMG_MODEL_DIR", "")
     models_dir: Path = Path(_env("H3IMG_MODELS_DIR", str(BASE_DIR / "models")))
-    device: str = _env("H3IMG_DEVICE", "cuda:0")
-    # 既定: GPU が 2 枚以上あれば TE を cuda:1 に置く(engine 側で解決)
-    te_device: str = _env("H3IMG_TE_DEVICE", "")
-    # text_encoder の層ストリーミング: auto(既定、TE が transformer と同じ GPU に載り、その GPU の
-    # 総容量が te_stream_auto_below_gb 未満なら有効)/ 1(常時)/ 0(無効)。有効時は 51 層の decoder を
-    # CPU(pinned)に置き、forward のたびに 1 層ずつ GPU へ流す(常駐 ~3GB、エンコード +1.1s、出力は bit 一致)。
+    # 使う GPU: H3IMG_GPU=1 のように番号で指定(H3IMG_DEVICE=cuda:1 と同じ)。TE は H3IMG_TE_GPU / H3IMG_TE_DEVICE。
+    # 既定: transformer は cuda:0、TE は GPU が 2 枚以上あれば cuda:1(engine 側で解決)
+    device: str = (f"cuda:{_env('H3IMG_GPU', '')}" if _env("H3IMG_GPU", "") else _env("H3IMG_DEVICE", "cuda:0"))
+    te_device: str = (f"cuda:{_env('H3IMG_TE_GPU', '')}" if _env("H3IMG_TE_GPU", "") else _env("H3IMG_TE_DEVICE", ""))
+    # VRAM 予算(GB、transformer 側 GPU)。auto(既定)= その GPU の総容量。起動時/ロード時に実際の空きと比べ
+    # 小さい方を予算にして、48gb / 32gb / 16gb / 8gb の構成(engine.PROFILES)を自動選択する。
+    # 生成中に CUDA OOM が起きたら一段下の構成へ自動で下げて 1 回だけやり直す(H3IMG_VRAM_FALLBACK=0 で無効)。
+    vram_gb: str = _env("H3IMG_VRAM_GB", "auto")
+    vram_fallback: bool = _env("H3IMG_VRAM_FALLBACK", "1") == "1"
+    # 以下 3 つは auto(既定)なら VRAM 予算から決まる。明示すると予算より優先する。
+    # transformer の量子化: int8wo(torchao、19GiB)/ ck-w4a8(comfy-kitchen W4A8、約 11GiB)
+    transformer_quant: str = _env("H3IMG_TRANSFORMER_QUANT", "auto")
+    # text_encoder の層ストリーミング(1 / 0): 51 層の decoder を pinned ホストから 1 層ずつ流す(常駐 ~0.3GB、
+    # エンコード +1.1s、出力は bit 一致)。lm_head 削除・埋め込み CPU 化・VAE スワップも同時に有効になる。
     te_stream: str = _env("H3IMG_TE_STREAM", "auto")
-    te_stream_auto_below_gb: float = float(_env("H3IMG_TE_STREAM_AUTO_BELOW_GB", "40"))
-    # transformer ブロックのストリーミング(12GB 級向け): auto(GPU 総容量が transformer_stream_auto_below_gb
-    # 未満なら有効)/ 1 / 0。50 ブロックを pinned ホストから 1 つずつ先読みしながら流す。
+    # transformer ブロックのストリーミング(1 / 0): 50 ブロックを pinned ホストから先読みしながら流す(8GB 級)。
     transformer_stream: str = _env("H3IMG_TRANSFORMER_STREAM", "auto")
-    transformer_stream_auto_below_gb: float = float(_env("H3IMG_TRANSFORMER_STREAM_AUTO_BELOW_GB", "15"))
-    # transformer の量子化: int8wo(torchao、19GiB)/ ck-w4a8(comfy-kitchen W4A8、約 11GiB・32GB 級向け)
-    transformer_quant: str = _env("H3IMG_TRANSFORMER_QUANT", "int8wo")
     # 既定のステップ数(2 / 3 / 6)。リクエストごとに上書き可(transformer の差し替えが走る)
     default_steps: int = int(_env("H3IMG_STEPS", "3"))
     # 起動時にロードする(1)か、初回リクエストまで遅延する(0、既定)
@@ -96,12 +99,17 @@ class Settings:
         self.cache_dir = Path(_env("H3IMG_CACHE_DIR", str(self.models_dir / "cache")))
         if self.default_steps not in STEP_PRESETS:
             raise ValueError(f"H3IMG_STEPS は {sorted(STEP_PRESETS)} のいずれかです: {self.default_steps}")
+        if self.vram_gb != "auto":
+            try:
+                float(self.vram_gb)
+            except ValueError:
+                raise ValueError("H3IMG_VRAM_GB は auto か数値(GB)です") from None
         if self.te_stream not in ("auto", "0", "1"):
             raise ValueError("H3IMG_TE_STREAM は auto / 0 / 1 のいずれかです")
         if self.transformer_stream not in ("auto", "0", "1"):
             raise ValueError("H3IMG_TRANSFORMER_STREAM は auto / 0 / 1 のいずれかです")
-        if self.transformer_quant not in ("int8wo", "ck-w4a8"):
-            raise ValueError("H3IMG_TRANSFORMER_QUANT は int8wo / ck-w4a8 のいずれかです")
+        if self.transformer_quant not in ("auto", "int8wo", "ck-w4a8"):
+            raise ValueError("H3IMG_TRANSFORMER_QUANT は auto / int8wo / ck-w4a8 のいずれかです")
         if self.default_generation_area not in ("native", "requested"):
             raise ValueError("H3IMG_GENERATION_AREA は native / requested のいずれかです")
         for d in (self.cache_dir, self.output_dir, self.input_dir):

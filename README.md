@@ -10,11 +10,12 @@
   本サーバは **AdaLN 射影の事前計算テーブル(bit 一致・近似なし)+ int8 重み量子化 + nf4 text_encoder**で
   transformer 常駐 ~19GB、text_encoder ~17GB に収めています。
 - **pDMD 2-step LoRA** をマージした 3 step を既定にし、6 step とほぼ同品質で 1.7 倍速。
-- 低 VRAM 構成(`H3IMG_TRANSFORMER_QUANT=ck-w4a8`): transformer を comfy-kitchen の W4A8 で ~11GB にし
+- **構成は VRAM 予算から自動選択**(`H3IMG_VRAM_GB`、既定は GPU の総容量と実際の空きの小さい方。OOM 時は一段下へ自動で下げる)。
+- 低 VRAM 構成(`32gb` 以下のプロファイル): transformer を comfy-kitchen の W4A8 で ~11GB にし
   (GEMM は int8 より速い)、text_encoder の 51 層を pinned ホスト RAM から 1 層ずつ流し、未使用の lm_head を
   捨て、埋め込み表を CPU に置いて常駐 ~0.3GB にする(出力は全 GPU 常駐時と bit 一致)。VAE も encode / decode
   の間だけ GPU に置く。**32GB 1 枚で peak ~29GB、16GB 1 枚で peak ~13GB**。
-- さらに `H3IMG_TRANSFORMER_STREAM=1`(15GB 未満の GPU で自動)で transformer の 50 ブロックも pinned ホスト RAM から
+- さらに `H3IMG_TRANSFORMER_STREAM=1`(`8gb` プロファイルで自動)で transformer の 50 ブロックも pinned ホスト RAM から
   先読みしながら流し、**8GB 級(実使用 4.2GB)**まで下がる。先読みが効くので速度は 16GB 構成と同じ。
 - 非同期ジョブ API と、生成・参照編集・履歴・ダウンロード・削除ができる UI。
 
@@ -37,13 +38,22 @@
 | transformer(int8wo + AdaLN テーブル)+ VAE | **~19GB** | 生成時 peak 20.8GB(1024²)〜21.4GB(2048² 編集)。実測は 4096² 未確認 |
 | text_encoder(Qwen3-VL-32B、nf4・51 層) | **~17GB** | 2 枚目の GPU があれば自動でそちらへ(`H3IMG_TE_DEVICE`) |
 
-| 構成 | 必要な GPU | 設定 |
-|---|---|---|
-| 1 枚(int8wo、最高速) | **48GB 級**(transformer 21GB + TE 17GB ≈ 38GB + 余裕) | 既定 |
-| 2 枚(int8wo) | GPU0 **24GB 級**(transformer)+ GPU1 **20GB 以上**(TE) | 既定(2 枚あれば自動) |
-| 1 枚(W4A8) | **32GB 級**: peak 29.1GB(2048²)/ 30.2GB(2048² 編集) | `H3IMG_TRANSFORMER_QUANT=ck-w4a8 H3IMG_TE_STREAM=0` |
-| 1 枚(W4A8 + TE ストリーミング) | **16GB 級**: peak 12.5GB(1024²)/ 12.6GB(2048²)/ 13.1GB(1664×2496 編集) | `H3IMG_TRANSFORMER_QUANT=ck-w4a8`(TE ストリーミングは 40GB 未満の GPU で自動 ON) |
-| 1 枚(上記 + transformer ブロックストリーミング) | **8GB 級**: torch peak 2.4GB(2048²)/ 2.9GB(編集)、nvidia-smi のプロセス実使用 max 4.2GB | `H3IMG_TRANSFORMER_QUANT=ck-w4a8`(ブロックストリーミングは 15GB 未満の GPU で自動 ON)。ホスト RAM +31GB |
+構成は **VRAM 予算から自動で選びます**。既定(`H3IMG_VRAM_GB=auto`)は使う GPU の総容量を予算にし、
+ロード時の実際の空きがそれより小さければ空きの方を予算にします(他のプロセスが使っていても溢れない)。
+`H3IMG_VRAM_GB=16` のように起動時に指定すれば、大きい GPU でも 16GB 級の構成で動かせます。
+
+| プロファイル | 構成 | 選ばれる条件(空き VRAM) | 実測 peak |
+|---|---|---|---|
+| `48gb` | int8wo、TE 常駐(最高速) | ≥ 40GB(TE が別 GPU なら ≥ 22.5GB) | 37〜38.4GB |
+| `32gb` | W4A8、TE 常駐 | ≥ 31.5GB(別 GPU なら ≥ 14.5GB) | 28.7〜30.2GB |
+| `16gb` | W4A8 + TE 層ストリーミング + VAE スワップ | ≥ 14.5GB | 12.5〜13.1GB |
+| `8gb` | 上記 + transformer ブロックストリーミング | それ未満 | 2.4〜2.9GB(プロセス実使用 4.2GB)、ホスト RAM +31GB |
+
+- GPU が 2 枚あれば TE は既定で 2 枚目に置きます(`H3IMG_TE_GPU`)。使う GPU は `H3IMG_GPU=1` のように番号で指定。
+- 生成中に CUDA OOM が起きたら(ロード後に他のプロセスが VRAM を取った等)、**一段下のプロファイルへ自動で下げて
+  やり直します**(`H3IMG_VRAM_FALLBACK=0` で無効)。
+- `H3IMG_TRANSFORMER_QUANT` / `H3IMG_TE_STREAM` / `H3IMG_TRANSFORMER_STREAM` を明示すると予算より優先します。
+- 選ばれたプロファイルは `/api/status` の `engine.profile` とジョブ結果の `profile` で確認できます。
 
 W4A8 の 3 構成は GPU の空きを 23.5GB / 15.5GB / 7.3GB に制限した RTX PRO 6000(sm_120)で検証した値です
 (本物の 8〜32GB カードでは未検証。カーネルは Triton/CUDA 実装なので他世代でも動く見込みですが確認していません)。
@@ -195,10 +205,12 @@ OpenAI 互換の LLM(例: llama.cpp server の gemma 系)に送り、短い日�
 |---|---|---|
 | `H3IMG_HOST` / `H3IMG_PORT` | 127.0.0.1 / 8633 | 待ち受けアドレスとポート |
 | `H3IMG_STEPS` | 3 | 既定ステップ(2 / 3 / 6) |
-| `H3IMG_TRANSFORMER_QUANT` | int8wo | transformer の量子化。`ck-w4a8` で ~11GB(32GB / 24GB 構成) |
-| `H3IMG_TRANSFORMER_STREAM` | auto | transformer 50 ブロックのストリーミング(8GB 級向け)。auto = GPU が 15GB 未満なら ON(`H3IMG_TRANSFORMER_STREAM_AUTO_BELOW_GB`)。ck-w4a8 と併用 |
-| `H3IMG_TE_STREAM` | auto | text_encoder の層ストリーミング(+ lm_head 削除・埋め込み CPU 化・VAE スワップ)。auto = TE と transformer が同じ GPU で、その GPU が 40GB 未満なら ON(`H3IMG_TE_STREAM_AUTO_BELOW_GB`) |
-| `H3IMG_DEVICE` / `H3IMG_TE_DEVICE` | cuda:0 /(2 枚あれば cuda:1) | transformer / text_encoder の配置先 |
+| `H3IMG_TRANSFORMER_QUANT` | auto | transformer の量子化(`int8wo` 19GiB / `ck-w4a8` ~11GB)。auto = プロファイルに従う |
+| `H3IMG_TE_STREAM` | auto | text_encoder の層ストリーミング(+ lm_head 削除・埋め込み CPU 化・VAE スワップ)。0 / 1 で明示 |
+| `H3IMG_TRANSFORMER_STREAM` | auto | transformer 50 ブロックのストリーミング(8GB 級)。0 / 1 で明示 |
+| `H3IMG_GPU` / `H3IMG_TE_GPU` | 0 /(2 枚あれば 1) | transformer / text_encoder を置く GPU 番号(`H3IMG_DEVICE=cuda:N` / `H3IMG_TE_DEVICE` でも可) |
+| `H3IMG_VRAM_GB` | auto | VRAM 予算(GB)。auto = GPU の総容量。実際の空きと小さい方で 48gb / 32gb / 16gb / 8gb プロファイルを選ぶ |
+| `H3IMG_VRAM_FALLBACK` | 1 | 生成中の CUDA OOM で一段下のプロファイルへ自動で下げてやり直す |
 | `H3IMG_GENERATION_AREA` | requested | 既定キャンバス(`native` = 最低 4MP) |
 | `H3IMG_PRELOAD` | 0 | 1 で起動時にロード |
 | `H3IMG_MODELS_DIR` | `./models` | te / lora / cache の置き場 |
@@ -278,7 +290,7 @@ attention と FF の Linear 312 層(50 ブロック × 6 + token refiner 2 × 6)
 
 ### 6. W4A8(4bit 重み・int8 活性)で transformer を ~11GB にする(32GB 級向け、GEMM 1.5 倍速)
 
-`H3IMG_TRANSFORMER_QUANT=ck-w4a8`。ComfyUI が実装した W4A8 の実体である
+`H3IMG_TRANSFORMER_QUANT=ck-w4a8`(`32gb` 以下のプロファイルで自動)。ComfyUI が実装した W4A8 の実体である
 [comfy-kitchen](https://pypi.org/project/comfy-kitchen/)(Apache-2.0、Triton/CUDA カーネル)を使い、
 2 の 312 層を「重み 4bit(group16 のスケール + 16 値 codebook)・活性 int8(回転付き)」にします。
 int8wo の 19GiB が 10.7GiB になり、GEMM 単体は bf16 の 1.5 倍、int8wo より速い(2048² 4.1s → 2.8s)。
@@ -290,7 +302,7 @@ pDMD LoRA は fp32 でマージしてから量子化します(2 と同じ)。キ
 
 ### 7. text_encoder の 51 層を 1 層ずつ流す(常駐 17GB → 0.3GB、16GB 級向け)
 
-`H3IMG_TE_STREAM=1`(40GB 未満の GPU では自動)。nf4 の decoder 51 層を最初から CPU に読み(GPU に載せて
+`H3IMG_TE_STREAM=1`(`16gb` 以下のプロファイルで自動)。nf4 の decoder 51 層を最初から CPU に読み(GPU に載せて
 から退避すると、ロードの時点で 16GB を超える)、pinned ホスト RAM から forward hook で 1 層(~0.3GB)ずつ
 GPU へ往復させます。bitsandbytes の nf4 パラメータは `.to()` の往復で量子化状態を保つので、
 **hidden_states[50] は全 GPU 常駐時と bit 一致**(実測、最大誤差 0.0)。あわせて:
@@ -306,7 +318,7 @@ GPU へ往復させます。bitsandbytes の nf4 パラメータは `.to()` の�
 
 ### 8. transformer の 50 ブロックを先読みしながら流す(常駐 11GB → 1GB、8GB 級向け)
 
-`H3IMG_TRANSFORMER_STREAM=1`(15GB 未満の GPU では自動)。W4A8 化した transformer_blocks(各 ~0.2GB)を
+`H3IMG_TRANSFORMER_STREAM=1`(`8gb` プロファイルで自動)。W4A8 化した transformer_blocks(各 ~0.2GB)を
 pinned ホスト RAM に置き、forward hook でブロック i の計算中に i+1 を別の CUDA stream でコピーします。
 GPU に残るのは token refiner・入出力射影などの ~1GB。コピーが計算に隠れるので、**速度は 16GB 構成と同じ**
 (2048² 4.2s)、出力は常駐時と**ピクセル一致**です。ホスト RAM は TE と合わせて +31GB 使います。
@@ -423,7 +435,8 @@ Standalone server + browser UI for MiniMax-H3-Image (33B text-to-image / referen
 projections (39% of the weights) are replaced by an exact precomputed table (the sampling timesteps are
 fixed), the remaining linears are torchao int8 weight-only, and the pDMD 2-step LoRA is merged for a 3-step
 default. Measured on an RTX PRO 6000: 1.8s @1024², 4.1s @2048², 6.7s for a 2048² reference edit.
-Low-VRAM mode (`H3IMG_TRANSFORMER_QUANT=ck-w4a8`): the transformer linears become W4A8 (comfy-kitchen
+The configuration is picked automatically from a VRAM budget (`H3IMG_VRAM_GB`, default = the GPU's size capped by
+the actual free memory; on a CUDA OOM during generation it steps down one profile and retries). Low-VRAM profiles: the transformer linears become W4A8 (comfy-kitchen
 kernels, ~11GB, faster GEMM than int8) and the 51 text-encoder layers are streamed one at a time from pinned
 host RAM (resident ~0.3GB after dropping the unused lm_head and keeping the embedding table on CPU;
 bit-exact output), and the VAE is moved to the GPU only for encode/decode, so the whole model runs on a

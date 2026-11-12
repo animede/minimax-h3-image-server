@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import functools
+from dataclasses import dataclass
 import logging
 import threading
 import time
@@ -48,6 +49,27 @@ class _UnusedHead(torch.nn.Module):
         raise RuntimeError("text_encoder の lm_head は不要として削除済みです(hidden_states のみ使用)")
 
 
+@dataclass(frozen=True)
+class Profile:
+    """VRAM 予算に応じた構成。need_same = TE が transformer と同じ GPU のときに要る空き(GB)、
+    need_split = TE が別 GPU のとき transformer 側に要る空き。実測 peak + 1〜1.5GB の余裕。"""
+    name: str
+    quant: str
+    te_stream: bool
+    transformer_stream: bool
+    need_same: float
+    need_split: float
+
+
+# 上から順に、予算が足りる最初のものを選ぶ(実測: 48gb=peak 38.4 / 32gb=30.2 / 16gb=13.1 / 8gb=実使用 4.2)
+PROFILES: tuple[Profile, ...] = (
+    Profile("48gb", "int8wo", False, False, need_same=40.0, need_split=22.5),
+    Profile("32gb", "ck-w4a8", False, False, need_same=31.5, need_split=14.5),
+    Profile("16gb", "ck-w4a8", True, False, need_same=14.5, need_split=14.5),
+    Profile("8gb", "ck-w4a8", True, True, need_same=5.0, need_split=4.0),
+)
+
+
 class Engine:
     def __init__(self, settings: Settings) -> None:
         self.s = settings
@@ -64,6 +86,8 @@ class Engine:
         self.loaded_steps: int | None = None
         self._default_sigmas: list[float] | None = None
         self._repo: str | None = None
+        self.profile: Profile | None = None       # ロード時に決まる(unload で None に戻る)
+        self._profile_floor = 0                   # OOM フォールバックで下げた段(PROFILES の index の下限)
 
     # -- 状態 ------------------------------------------------------------------
 
@@ -75,7 +99,9 @@ class Engine:
         return {
             "loaded": self.loaded,
             "steps": self.loaded_steps,
-            "transformer_quant": self.s.transformer_quant,
+            "profile": self.profile.name if self.profile else None,
+            "vram_budget_gb": self.s.vram_gb,
+            "transformer_quant": self.profile.quant if self.profile else self.s.transformer_quant,
             "device": str(self.device),
             "te_device": str(self.te_device),
             "te_loaded": self.te is not None,
@@ -139,19 +165,45 @@ class Engine:
     te_streamed: bool = False
     transformer_streamed: bool = False
 
+    # -- VRAM 予算 → 構成 ----------------------------------------------------------
+
+    def _vram_budget_gb(self) -> tuple[float, float, float]:
+        """(予算, 要求, 実際の空き)。予算 = min(H3IMG_VRAM_GB または総容量, 今の空き)。"""
+        free, total = torch.cuda.mem_get_info(self.device)
+        free_gb, total_gb = free / 2**30, total / 2**30
+        requested = float(self.s.vram_gb) if self.s.vram_gb != "auto" else total_gb
+        return min(requested, free_gb), requested, free_gb
+
+    def _resolve_profile(self) -> Profile:
+        budget, requested, free_gb = self._vram_budget_gb()
+        split = self.te_device != self.device
+        chosen = PROFILES[-1]
+        for i, p in enumerate(PROFILES):
+            if i < self._profile_floor:
+                continue
+            if budget >= (p.need_split if split else p.need_same):
+                chosen = p
+                break
+        else:
+            logger.warning("空き VRAM %.1fGB は最小構成 %s の目安 %.1fGB を下回っています(そのまま試みます)",
+                           budget, chosen.name, chosen.need_split if split else chosen.need_same)
+        # 明示指定があれば上書き
+        quant = self.s.transformer_quant if self.s.transformer_quant != "auto" else chosen.quant
+        te_stream = chosen.te_stream if self.s.te_stream == "auto" else self.s.te_stream == "1"
+        tr_stream = chosen.transformer_stream if self.s.transformer_stream == "auto" else self.s.transformer_stream == "1"
+        if split:
+            te_stream = False  # TE が別 GPU ならストリーミングは不要(そちらに常駐)
+        prof = Profile(chosen.name, quant, te_stream, tr_stream, chosen.need_same, chosen.need_split)
+        logger.info("VRAM profile: %s (budget %.1fGB = min(requested %.1f, free %.1f), TE %s) -> quant=%s te_stream=%s "
+                    "transformer_stream=%s", prof.name, budget, requested, free_gb,
+                    "split" if split else "same GPU", prof.quant, prof.te_stream, prof.transformer_stream)
+        return prof
+
     def _transformer_stream_enabled(self) -> bool:
-        if self.s.transformer_stream in ("0", "1"):
-            return self.s.transformer_stream == "1"
-        total_gb = torch.cuda.get_device_properties(self.device).total_memory / 2**30
-        return total_gb < self.s.transformer_stream_auto_below_gb
+        return self.profile.transformer_stream
 
     def _te_stream_enabled(self) -> bool:
-        if self.s.te_stream == "1":
-            return True
-        if self.s.te_stream == "0":
-            return False
-        total_gb = torch.cuda.get_device_properties(self.device).total_memory / 2**30
-        return total_gb < self.s.te_stream_auto_below_gb
+        return self.profile.te_stream
 
     def _stream_text_encoder(self, te) -> None:
         """decoder 51 層を pinned CPU に退避し、forward hook で 1 層ずつ GPU へ往復させる。
@@ -258,7 +310,7 @@ class Engine:
                 raise RuntimeError(f"steps={steps} には pDMD LoRA が必要です: {self.s.lora_path}(H3IMG_LORA_PATH)")
             lora = str(self.s.lora_path)
         t0 = time.time()
-        quant = self.s.transformer_quant
+        quant = self.profile.quant
         cache_name = {"int8wo": "int8wo_adaln_table", "ck-w4a8": "ckw4a8_adaln_table"}[quant] + tag
         stream = self._transformer_stream_enabled()
         tr = pruned_image.load_transformer(self._resolve_repo(), self.pipe, self.device,
@@ -293,6 +345,8 @@ class Engine:
             self._load_locked(steps)
 
     def _load_locked(self, steps: int) -> None:
+        if self.profile is None:
+            self.profile = self._resolve_profile()
         if self.pipe is None:
             self.pipe = self._build_pipeline()
         if self.te is None:
@@ -335,17 +389,36 @@ class Engine:
 
     def unload(self) -> dict:
         with self.lock:
-            freed = [n for n, v in (("transformer", self.transformer), ("text_encoder", self.te),
-                                    ("vae", self.vae)) if v is not None]
-            self._drop_transformer()
-            self.te = self.vae = self.pipe = None
-            import gc
-            gc.collect()
-            for d in {self.device, self.te_device}:
-                with torch.cuda.device(d):
-                    torch.cuda.empty_cache()
-            logger.info("unloaded: %s", freed)
-            return {"freed": freed}
+            return self._unload_locked()
+
+    def _unload_locked(self) -> dict:
+        freed = [n for n, v in (("transformer", self.transformer), ("text_encoder", self.te),
+                                ("vae", self.vae)) if v is not None]
+        self._drop_transformer()
+        self.te = self.vae = self.pipe = None
+        self.te_streamed = self.transformer_streamed = False
+        self.profile = None
+        import gc
+        gc.collect()
+        for d in {self.device, self.te_device}:
+            with torch.cuda.device(d):
+                torch.cuda.empty_cache()
+        logger.info("unloaded: %s", freed)
+        return {"freed": freed}
+
+    def _fallback_after_oom(self, where: str) -> bool:
+        """OOM 後に一段下の構成へ下げる。下げられなければ False。"""
+        if not self.s.vram_fallback or self.profile is None:
+            return False
+        idx = next(i for i, p in enumerate(PROFILES) if p.name == self.profile.name)
+        if idx + 1 >= len(PROFILES):
+            return False
+        prev = self.profile.name
+        self._unload_locked()
+        self._profile_floor = idx + 1
+        self.profile = self._resolve_profile()
+        logger.warning("CUDA OOM (%s): 構成を %s -> %s に下げてやり直します", where, prev, self.profile.name)
+        return True
 
     # -- 生成 ------------------------------------------------------------------
 
@@ -356,34 +429,53 @@ class Engine:
         steps = req.steps or self.s.default_steps
         area = req.generation_area or self.s.default_generation_area
         with self.lock:
-            self._load_locked(steps)
             if req.width * req.height > self.s.max_pixels:
                 raise ValueError(f"width*height が上限 {self.s.max_pixels} px を超えています")
-            kw = dict(prompt=req.prompt, height=req.height, width=req.width, output="images")
-            if area == "requested":
-                kw["min_generation_area"] = 1024  # 4MP 最低キャンバスを無効化(要求サイズで生成)
-            if images:
-                kw["image"] = images if len(images) > 1 else images[0]
-            seed = req.seed if req.seed is not None else int(torch.randint(0, 2**31 - 1, (1,)).item())
-            kw["generator"] = torch.Generator().manual_seed(seed)
-            for d in {self.device, self.te_device}:
-                torch.cuda.reset_peak_memory_stats(d)
-            self._ctx = {"cancel": cancel, "progress": progress}
-            t0 = time.time()
-            try:
-                if cancel.is_set():
-                    raise Interrupted("中断要求により生成を停止しました")
-                out = self.pipe(**kw)
-                torch.cuda.synchronize(self.device)
-            finally:
-                self._ctx = None
-            elapsed = time.time() - t0
-            stats = {
-                "generation_seconds": round(elapsed, 2),
-                "peak_vram_gb": round(torch.cuda.max_memory_allocated(self.device) / 2**30, 2),
-                "peak_vram_te_gb": round(torch.cuda.max_memory_allocated(self.te_device) / 2**30, 2),
-                "steps_used": steps,
-                "seed": seed,
-                "generation_area": area,
-            }
-            return out[0], stats
+            for attempt in range(len(PROFILES)):
+                err = None
+                try:
+                    return self._generate_locked(req, images, progress, cancel, steps, area)
+                except torch.cuda.OutOfMemoryError as exc:
+                    err = exc
+                # except ブロックの外で処理する: 例外のトレースバックがパイプライン内部のフレーム(旧 transformer や
+                # 途中の latents への参照)を掴んだままだと、unload しても VRAM が解放されない(実測 +13GB 残留)。
+                can_fallback = self.s.vram_fallback and self.profile is not None \
+                    and self.profile.name != PROFILES[-1].name
+                if not can_fallback:
+                    raise err
+                del err
+                torch.cuda.empty_cache()
+                self._fallback_after_oom("generate")
+            raise RuntimeError("unreachable")
+
+    def _generate_locked(self, req, images, progress, cancel, steps: int, area: str) -> tuple:
+        self._load_locked(steps)
+        kw = dict(prompt=req.prompt, height=req.height, width=req.width, output="images")
+        if area == "requested":
+            kw["min_generation_area"] = 1024  # 4MP 最低キャンバスを無効化(要求サイズで生成)
+        if images:
+            kw["image"] = images if len(images) > 1 else images[0]
+        seed = req.seed if req.seed is not None else int(torch.randint(0, 2**31 - 1, (1,)).item())
+        kw["generator"] = torch.Generator().manual_seed(seed)
+        for d in {self.device, self.te_device}:
+            torch.cuda.reset_peak_memory_stats(d)
+        self._ctx = {"cancel": cancel, "progress": progress}
+        t0 = time.time()
+        try:
+            if cancel.is_set():
+                raise Interrupted("中断要求により生成を停止しました")
+            out = self.pipe(**kw)
+            torch.cuda.synchronize(self.device)
+        finally:
+            self._ctx = None
+        elapsed = time.time() - t0
+        stats = {
+            "generation_seconds": round(elapsed, 2),
+            "peak_vram_gb": round(torch.cuda.max_memory_allocated(self.device) / 2**30, 2),
+            "peak_vram_te_gb": round(torch.cuda.max_memory_allocated(self.te_device) / 2**30, 2),
+            "steps_used": steps,
+            "seed": seed,
+            "generation_area": area,
+            "profile": self.profile.name,
+        }
+        return out[0], stats

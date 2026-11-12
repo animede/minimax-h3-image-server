@@ -40,6 +40,7 @@ class Job:
     generation_seconds: float | None = None
     peak_vram_gb: float | None = None
     steps_used: int | None = None
+    profile: str | None = None
     cancel: threading.Event = field(default_factory=threading.Event)
 
     def public(self) -> dict[str, Any]:
@@ -48,7 +49,7 @@ class Job:
             "image_url": self.image_url, "video_url": None,
             "request": self.request.model_dump(), "created_at": self.created_at,
             "updated_at": self.updated_at, "generation_seconds": self.generation_seconds,
-            "peak_vram_gb": self.peak_vram_gb, "steps_used": self.steps_used,
+            "peak_vram_gb": self.peak_vram_gb, "steps_used": self.steps_used, "profile": self.profile,
         }
 
 
@@ -145,6 +146,7 @@ class JobManager:
                 job.generation_seconds = stats["generation_seconds"]
                 job.peak_vram_gb = stats["peak_vram_gb"]
                 job.steps_used = stats["steps_used"]
+                job.profile = stats.get("profile")
                 job.progress, job.status = 1.0, "completed"
                 logger.info("job %s completed: %s %dx%d steps=%s %.1fs peak=%.1fGB seed=%s",
                             job.id, job.request.mode, job.request.width, job.request.height,
