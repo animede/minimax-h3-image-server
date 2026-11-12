@@ -10,6 +10,9 @@
 - 残りの Linear(blocks 50 × 6 + token_refiner 2 × 6 = 312 層)は torchao
   `Int8WeightOnlyConfig(version=2, PerRow)`(動画 H3 の本番 int8 と同じレシピ)で、
   シャードから 1 テンソルずつ GPU へ上げて量子化する(bf16 66GB を CPU/GPU に全展開しない)。
+- quant="ck-w4a8": comfy-kitchen の W4A8(重み 4bit group16 + codebook、活性 int8 回転)。
+  int8wo の 19GiB → 約 11GiB。GEMM は bf16 比 1.5 倍速(torch 2.11 + sm_120 実測)。
+  `CKW4A8Linear` は forward を全面差し替えた推論専用 Linear(動画 H3 の `core/pruned.py` と同型)。
 - 時刻集合が変わる構成(例: 2-step pDMD LoRA の別スケジュール)はテーブルを作り直す必要が
   ある。未知の時刻で forward されたら黙って誤らず例外にする。
 
@@ -142,6 +145,65 @@ def _set_module(root: nn.Module, name: str, value: nn.Module) -> None:
     setattr(parent, attr, value)
 
 
+class CKW4A8Linear(nn.Linear):
+    """comfy-kitchen W4A8 の推論専用 Linear(重みは 4bit パック + スケール群のバッファ、bias なし)。
+
+    バッファ形状は in/out_features から決まるので、meta で組んでから
+    `load_state_dict(assign=True)` するキャッシュ再ロードがそのまま通る。
+    注意: 親モデルに `.to(dtype=...)` を掛けると fp8/f32 のスケールが壊れる(device 移動のみ可)。
+    """
+
+    GROUP_SIZE = 16
+
+    @staticmethod
+    def convrot_groupsize_for(in_features: int) -> int:
+        for g in (256, 128, 64, 32, 16):
+            if in_features % g == 0:
+                return g
+        raise RuntimeError(f"in_features={in_features} は 16 で割り切れず W4A8 化できません")
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__(in_features, out_features, bias=False, device="meta")
+        self.convrot_groupsize = self.convrot_groupsize_for(in_features)
+        del self._parameters["weight"]
+        self.register_buffer("qdata", torch.empty(out_features, in_features // 2, dtype=torch.int8, device="meta"))
+        self.register_buffer("s_rel", torch.empty(out_features, in_features // self.GROUP_SIZE,
+                                                  dtype=torch.float8_e4m3fn, device="meta"))
+        self.register_buffer("s_channel", torch.empty(out_features, dtype=torch.float32, device="meta"))
+        self.register_buffer("codebook", torch.empty(16, dtype=torch.float32, device="meta"))
+
+    @classmethod
+    def from_weight(cls, w: torch.Tensor, device: torch.device) -> "CKW4A8Linear":
+        import comfy_kitchen as ck
+
+        out_f, in_f = w.shape
+        qdata, s_rel, s_channel, correction, codebook = ck.quantize_w4a8_int8_weight(
+            w.to(device, torch.bfloat16), group_size=cls.GROUP_SIZE,
+            convrot_groupsize=cls.convrot_groupsize_for(in_f))
+        if correction is not None:
+            raise RuntimeError("quantize_w4a8_int8_weight が correction を返しました(未対応)")
+        new = cls(in_f, out_f)
+        new.qdata, new.s_rel, new.s_channel, new.codebook = qdata, s_rel, s_channel, codebook
+        return new
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        import comfy_kitchen as ck
+
+        shape = x.shape
+        y = ck.w4a8_int8_linear(x.reshape(-1, shape[-1]), self.qdata, self.s_rel, self.s_channel,
+                                codebook=self.codebook, correction=None, bias=None,
+                                group_size=self.GROUP_SIZE, convrot_groupsize=self.convrot_groupsize,
+                                out_dtype=x.dtype)
+        return y.reshape(*shape[:-1], y.shape[-1])
+
+
+def _replace_quant_targets_with_ck_shells(tr) -> None:
+    """キャッシュ再ロード用: 量子化対象の nn.Linear(meta)を CKW4A8Linear(meta)へ置換する。"""
+    for name, mod in list(tr.named_modules()):
+        if isinstance(mod, nn.Linear) and _is_quant_target(name + ".weight"):
+            _set_module(tr, name, CKW4A8Linear(mod.in_features, mod.out_features))
+
+
 def load_lora_pairs(lora_path: str) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor]], float]:
     """diffusers レイアウト(`transformer.<module>.lora_A/B.weight`)の LoRA を {module: (A, B)} に読む。
     scale はメタデータ `lora_scale`(pDMD 2-step は 1.0、alpha=rank=128)。"""
@@ -167,6 +229,7 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
     quant="int8wo": torchao Int8WeightOnly(キャッシュ可。eager では bf16 へ逆量子化してから
     GEMM するため bnb より遅い、2026-11-11 実測)。
     quant="bnb-int8": bitsandbytes LLM.int8(真の int8 GEMM、速い。キャッシュ非対応で毎回構築)。
+    quant="ck-w4a8": comfy-kitchen W4A8(約 11GiB、キャッシュ可)。
     """
     from accelerate import init_empty_weights
     from accelerate.utils import set_module_tensor_to_device
@@ -236,6 +299,9 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
                         n_merged += 1
                     if quant == "bnb-int8":
                         _set_module(tr, mod_name, _bnb_int8_linear(w.cpu() if w.is_cuda else w, device))
+                    elif quant == "ck-w4a8":
+                        _set_module(tr, mod_name, CKW4A8Linear.from_weight(w, device))
+                        del w
                     else:
                         _assign(tr, name, device, w)
                         quantize_(modules[mod_name], cfg)
@@ -283,6 +349,8 @@ def load_cache(cache_dir: Path, device: torch.device):
         tr = Cls.from_config(config)
     sd = torch.load(str(cache_dir / STATE_FILENAME), map_location="cpu", weights_only=False)
     hidden = config["hidden_size"]
+    if any(k.endswith(".qdata") for k in sd):
+        _replace_quant_targets_with_ck_shells(tr)
     for i in range(len(tr.transformer_blocks)):
         k = f"transformer_blocks.{i}.adaln_proj."
         _replace_adaln(tr, i, AdaLNTable(sd[k + "keys"], sd[k + "table"], hidden))

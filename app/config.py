@@ -56,6 +56,13 @@ class Settings:
     device: str = _env("H3IMG_DEVICE", "cuda:0")
     # 既定: GPU が 2 枚以上あれば TE を cuda:1 に置く(engine 側で解決)
     te_device: str = _env("H3IMG_TE_DEVICE", "")
+    # text_encoder の層ストリーミング: auto(既定、TE が transformer と同じ GPU に載り、その GPU の
+    # 総容量が te_stream_auto_below_gb 未満なら有効)/ 1(常時)/ 0(無効)。有効時は 51 層の decoder を
+    # CPU(pinned)に置き、forward のたびに 1 層ずつ GPU へ流す(常駐 ~3GB、エンコード +1.1s、出力は bit 一致)。
+    te_stream: str = _env("H3IMG_TE_STREAM", "auto")
+    te_stream_auto_below_gb: float = float(_env("H3IMG_TE_STREAM_AUTO_BELOW_GB", "40"))
+    # transformer の量子化: int8wo(torchao、19GiB)/ ck-w4a8(comfy-kitchen W4A8、約 11GiB・32GB 級向け)
+    transformer_quant: str = _env("H3IMG_TRANSFORMER_QUANT", "int8wo")
     # 既定のステップ数(2 / 3 / 6)。リクエストごとに上書き可(transformer の差し替えが走る)
     default_steps: int = int(_env("H3IMG_STEPS", "3"))
     # 起動時にロードする(1)か、初回リクエストまで遅延する(0、既定)
@@ -85,6 +92,10 @@ class Settings:
         self.cache_dir = Path(_env("H3IMG_CACHE_DIR", str(self.models_dir / "cache")))
         if self.default_steps not in STEP_PRESETS:
             raise ValueError(f"H3IMG_STEPS は {sorted(STEP_PRESETS)} のいずれかです: {self.default_steps}")
+        if self.te_stream not in ("auto", "0", "1"):
+            raise ValueError("H3IMG_TE_STREAM は auto / 0 / 1 のいずれかです")
+        if self.transformer_quant not in ("int8wo", "ck-w4a8"):
+            raise ValueError("H3IMG_TRANSFORMER_QUANT は int8wo / ck-w4a8 のいずれかです")
         if self.default_generation_area not in ("native", "requested"):
             raise ValueError("H3IMG_GENERATION_AREA は native / requested のいずれかです")
         for d in (self.cache_dir, self.output_dir, self.input_dir):

@@ -2,12 +2,16 @@
 
 [MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)(33B、静止画生成 +
 最大 16 枚参照の編集)を **約 21GB の VRAM で、1024² を 1.8 秒・2048² を 4.1 秒**で動かす
-単独の画像サーバ + ブラウザ UI です。diffusers(main)ベース、コードは MIT ライセンス。
+単独の画像サーバ + ブラウザ UI です。**W4A8 量子化 + text_encoder の層ストリーミングで 24GB 1 枚でも動きます**
+(peak 16〜17GB、1024² 1.9 秒・2048² 3.9 秒)。diffusers(main)ベース、コードは MIT ライセンス。
 
 - 本家の bf16 は transformer 66GB + text_encoder 66.7GB で 80GB GPU にも同時に載りませんが、
   本サーバは **AdaLN 射影の事前計算テーブル(bit 一致・近似なし)+ int8 重み量子化 + nf4 text_encoder**で
   transformer 常駐 ~19GB、text_encoder ~17GB に収めています。
 - **pDMD 2-step LoRA** をマージした 3 step を既定にし、6 step とほぼ同品質で 1.7 倍速。
+- 低 VRAM 構成(`H3IMG_TRANSFORMER_QUANT=ck-w4a8`): transformer を comfy-kitchen の W4A8 で ~11GB にし
+  (GEMM は int8 より速い)、text_encoder の 51 層を pinned ホスト RAM から 1 層ずつ流して常駐 ~3GB にする
+  (出力は全 GPU 常駐時と bit 一致)。**32GB 1 枚で peak ~29GB、24GB 1 枚で peak ~17GB**。
 - 非同期ジョブ API と、生成・参照編集・履歴・ダウンロード・削除ができる UI。
 
 ## 目次
@@ -29,10 +33,15 @@
 | transformer(int8wo + AdaLN テーブル)+ VAE | **~19GB** | 生成時 peak 20.8GB(1024²)〜21.4GB(2048² 編集)。実測は 4096² 未確認 |
 | text_encoder(Qwen3-VL-32B、nf4・51 層) | **~17GB** | 2 枚目の GPU があれば自動でそちらへ(`H3IMG_TE_DEVICE`) |
 
-| 構成 | 必要な GPU |
-|---|---|
-| 1 枚で動かす | **48GB 級**(transformer 21GB + TE 17GB ≈ 38GB + 余裕) |
-| 2 枚で動かす(推奨) | GPU0 **24GB 級**(transformer)+ GPU1 **20GB 以上**(TE) |
+| 構成 | 必要な GPU | 設定 |
+|---|---|---|
+| 1 枚(int8wo、最高速) | **48GB 級**(transformer 21GB + TE 17GB ≈ 38GB + 余裕) | 既定 |
+| 2 枚(int8wo) | GPU0 **24GB 級**(transformer)+ GPU1 **20GB 以上**(TE) | 既定(2 枚あれば自動) |
+| 1 枚(W4A8) | **32GB 級**: peak 29.1GB(2048²)/ 30.2GB(2048² 編集) | `H3IMG_TRANSFORMER_QUANT=ck-w4a8 H3IMG_TE_STREAM=0` |
+| 1 枚(W4A8 + TE ストリーミング) | **24GB 級**: peak 16.1GB(2048²)/ 17.4GB(2048² 編集) | `H3IMG_TRANSFORMER_QUANT=ck-w4a8`(TE ストリーミングは 40GB 未満の GPU で自動 ON) |
+
+W4A8 の 2 構成は GPU の空きを 23.5GB に制限した RTX PRO 6000(sm_120)で検証した値です(本物の 24GB /
+32GB カードでは未検証。カーネルは Triton/CUDA 実装なので他世代でも動く見込みですが確認していません)。
 
 ホスト RAM: 量子化キャッシュがある状態では数 GB。初回のキャッシュ構築も bf16 を 1 テンソルずつ扱うため
 大きな RAM は要りません(実測ピーク +数 GB)。ディスクは [導入](#導入) 参照。
@@ -50,6 +59,20 @@ RTX PRO 6000 Blackwell(96GB、transformer)+ RTX PRO 5000 Blackwell(48GB、text_e
 | 参照編集 2048²(参照 1 枚) | **6.7s** | 11.3s | 5.0s |
 | peak VRAM(GPU0) | 20.8〜21.4GB | 同 | 同 |
 
+W4A8 構成(`ck-w4a8`、3 step、TE も同じ GPU):
+
+| ケース | 32GB 構成(TE 常駐) | 24GB 構成(TE ストリーミング) |
+|---|---|---|
+| T2I 1024² | 0.7s | 1.9s |
+| T2I 2048² | 2.8s | 3.9s |
+| 参照編集 1664×2496(参照 1 枚) | 5.6s | 6.8s |
+| T2I 2048² 6 step | — | 6.1s |
+| peak VRAM | 28.7〜30.2GB | 15.9〜17.4GB |
+
+W4A8 は int8wo より **GEMM が速い**(2048² で 4.1s → 2.8s)ので、TE ストリーミングの +1.1s を足しても
+int8wo と同程度です。品質は同一 seed で int8wo と並べて目視した範囲では同等でした(細部は seed 相当に
+変わります。下記[低 VRAM 化](#低-vram-化高速化の方法) 6 参照)。
+
 - ロード(初回生成時): text_encoder 3〜8s + transformer キャッシュ 12s + VAE 1s ≈ 20 秒。
   キャッシュ未作成の初回のみ +約 40 秒(bf16 シャードからの量子化)。
 - 品質: 3 step は 6 step と等倍目視でほぼ同等。**2 step は織り目状の微細パターンが出る**ためプレビュー向け。
@@ -64,7 +87,7 @@ RTX PRO 6000 Blackwell(96GB、transformer)+ RTX PRO 5000 Blackwell(48GB、text_e
 - NVIDIA GPU(上記)。sm_120(Blackwell)で検証。torch 2.11.0+cu130 のため CUDA 13 系ドライバが必要
 - Python 3.12、[uv](https://github.com/astral-sh/uv)(pip でも可)
 - ディスク: 本家モデル 64GB(HF キャッシュ)+ LoRA 1.4GB + 量子化済み text_encoder 17GB +
-  transformer キャッシュ 19GiB × 使うステップ種(3 step だけなら 19GiB)。
+  transformer キャッシュ 19GiB(int8wo)または 10.7GiB(ck-w4a8)× 使うステップ種。
   **text_encoder の作成時のみ一時的に +66.7GB**(bf16 ソース。`--delete-te-source` で作成後に削除可)
 
 ### 手順
@@ -166,6 +189,8 @@ OpenAI 互換の LLM(例: llama.cpp server の gemma 系)に送り、短い日�
 |---|---|---|
 | `H3IMG_HOST` / `H3IMG_PORT` | 127.0.0.1 / 8633 | 待ち受けアドレスとポート |
 | `H3IMG_STEPS` | 3 | 既定ステップ(2 / 3 / 6) |
+| `H3IMG_TRANSFORMER_QUANT` | int8wo | transformer の量子化。`ck-w4a8` で ~11GB(32GB / 24GB 構成) |
+| `H3IMG_TE_STREAM` | auto | text_encoder の層ストリーミング。auto = TE と transformer が同じ GPU で、その GPU が 40GB 未満なら ON(`H3IMG_TE_STREAM_AUTO_BELOW_GB`) |
 | `H3IMG_DEVICE` / `H3IMG_TE_DEVICE` | cuda:0 /(2 枚あれば cuda:1) | transformer / text_encoder の配置先 |
 | `H3IMG_GENERATION_AREA` | requested | 既定キャンバス(`native` = 最低 4MP) |
 | `H3IMG_PRELOAD` | 0 | 1 で起動時にロード |
@@ -180,7 +205,8 @@ OpenAI 互換の LLM(例: llama.cpp server の gemma 系)に送り、短い日�
 
 本家は transformer 66GB(bf16)+ text_encoder 66.7GB(bf16)で、80GB GPU でも両方は載りません。
 本サーバは次の 5 つを組み合わせて、transformer 側 ~19GB・text_encoder ~17GB に収め、6 step で 1.5 倍、
-3 step で 2 倍以上速くしています。各項目の数字は実測(RTX PRO 6000、1024² / 2048²)。
+3 step で 2 倍以上速くしています。さらに 6・7 で 32GB / 24GB の 1 枚構成に対応します。
+各項目の数字は実測(RTX PRO 6000、1024² / 2048²)。
 
 ### 1. AdaLN 射影を「事前計算テーブル」に置き換える(VRAM −26GB、誤差ゼロ)
 
@@ -243,13 +269,33 @@ attention と FF の Linear 312 層(50 ブロック × 6 + token refiner 2 × 6)
 時間が掛かります。`generation_area: "requested"`(既定)で要求サイズのまま生成すると 1024² が 3.5s → 1.5s に
 なります。品質は良好ですが、本家推奨の画質が欲しい場合は `"native"` を指定してください。
 
+### 6. W4A8(4bit 重み・int8 活性)で transformer を ~11GB にする(32GB 級向け、GEMM 1.5 倍速)
+
+`H3IMG_TRANSFORMER_QUANT=ck-w4a8`。ComfyUI が実装した W4A8 の実体である
+[comfy-kitchen](https://pypi.org/project/comfy-kitchen/)(Apache-2.0、Triton/CUDA カーネル)を使い、
+2 の 312 層を「重み 4bit(group16 のスケール + 16 値 codebook)・活性 int8(回転付き)」にします。
+int8wo の 19GiB が 10.7GiB になり、GEMM 単体は bf16 の 1.5 倍、int8wo より速い(2048² 4.1s → 2.8s)。
+pDMD LoRA は fp32 でマージしてから量子化します(2 と同じ)。キャッシュは `models/cache/ckw4a8_adaln_table*`。
+
+- 品質: 同一 seed で int8wo と並べて目視した範囲では同等(肌・髪・看板の文字とも破綻なし)。
+  ただし蒸留 3 step は量子化誤差で構図が seed 相当に動くので、ピクセル一致は期待できません。
+- 検証は sm_120(Blackwell)のみ。カーネル自体は Ampere 以降を想定した実装ですが、他世代は未確認。
+
+### 7. text_encoder の 51 層を 1 層ずつ流す(常駐 17GB → 3GB、24GB 級向け)
+
+`H3IMG_TE_STREAM=1`(40GB 未満の GPU では自動)。nf4 の decoder 51 層を pinned ホスト RAM に置き、
+forward hook で 1 層(~0.3GB)ずつ GPU へ往復させます。GPU に残るのは埋め込み・vision tower・norm の ~3GB。
+bitsandbytes の nf4 パラメータは `.to()` の往復で量子化状態を保つので、**hidden_states[50] は全 GPU 常駐時と
+bit 一致**(実測、最大誤差 0.0)。エンコードは 0.12s → 1.25s(+1.1s / 生成)ですが、プロンプトは 1 回しか
+通らないので生成全体では 24GB 構成でも int8wo 並みの速度です。ホスト RAM を +17GB 使います。
+
 ### 試して採らなかったこと
 
 | 案 | 結果 |
 |---|---|
 | sage attention | トークン数は VAE 16× + 2×2 パッチ化で 32× 縮小され、1024² で約 1.1k、2048² で約 4.2k。attention は 2048² でも全体の約 6% で効果が小さい。1024² は GPU ではなく CPU 側のカーネル発行が律速(CUDA Graph 化が次の候補) |
 | torchao int8wo + `torch.compile(dynamic=True)` | 毎回再コンパイルして使い物にならず(単層で 200〜3400ms)。静的形状での設計が必要 |
-| コミュニティの GGUF / nvfp4 / W4A8 | ComfyUI 専用形式か専用カーネルが要るため、diffusers 経路では未採用。nvfp4 は Blackwell で int8 比 +31% の報告あり(今後の候補) |
+| コミュニティの GGUF / nvfp4 | ComfyUI 専用形式か専用カーネルが要るため、diffusers 経路では未採用。nvfp4 は Blackwell で int8 比 +31% の報告あり(今後の候補)。W4A8 は comfy-kitchen を直接呼ぶ形で採用した(6) |
 
 ### VRAM の内訳(3 step、2048² 生成時)
 
@@ -261,6 +307,10 @@ attention と FF の Linear 312 層(50 ブロック × 6 + token refiner 2 × 6)
 | 生成時の活性・デコード | +1〜2 |
 | **GPU0 合計(peak)** | **~21** |
 | text_encoder nf4(別 GPU 可) | ~17 |
+
+W4A8 構成: transformer ck-w4a8 ~10.7 + テーブル等 0.5 + VAE 2.3 + 活性 → **~13〜14GB**。
+TE を同じ GPU に常駐させると +16.3GB(peak 29.1GB、32GB 級)、層ストリーミングなら +3.2〜3.8GB
+(peak 16.1GB、24GB 級)。
 
 ## ライセンスの注意
 
@@ -342,6 +392,11 @@ Standalone server + browser UI for MiniMax-H3-Image (33B text-to-image / referen
 projections (39% of the weights) are replaced by an exact precomputed table (the sampling timesteps are
 fixed), the remaining linears are torchao int8 weight-only, and the pDMD 2-step LoRA is merged for a 3-step
 default. Measured on an RTX PRO 6000: 1.8s @1024², 4.1s @2048², 6.7s for a 2048² reference edit.
+Low-VRAM mode (`H3IMG_TRANSFORMER_QUANT=ck-w4a8`): the transformer linears become W4A8 (comfy-kitchen
+kernels, ~11GB, faster GEMM than int8) and the 51 text-encoder layers are streamed one at a time from pinned
+host RAM (resident ~3GB, bit-exact output), so the whole model runs on a **single 32GB GPU (peak ~29GB) or a
+single 24GB GPU (peak ~17GB)** at 1.9s @1024² / 3.9s @2048² (verified on a 96GB GPU with free memory capped
+at 23.5GB; real 24GB/32GB cards not tested yet).
 How: (1) the AdaLN projections only depend on the (fixed) sampling timesteps, so their outputs are
 precomputed into a 68MB table with bit-exact results (−26GB); (2) the remaining 312 linears are int8
 weight-only, quantized shard-by-shard without materializing bf16 (−21GB, 1.6× faster than bnb LLM.int8);

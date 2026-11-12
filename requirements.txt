@@ -8,6 +8,7 @@ transformers==5.22.2
 accelerate>=1.12
 bitsandbytes==0.49.0
 torchao==0.18.0
+comfy-kitchen==0.2.37   # W4A8 カーネル(H3IMG_TRANSFORMER_QUANT=ck-w4a8)
 safetensors>=0.6
 huggingface_hub
 pillow
