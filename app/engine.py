@@ -28,6 +28,26 @@ class Interrupted(RuntimeError):
     pass
 
 
+class _CpuEmbedding(torch.nn.Module):
+    """CPU 常駐の埋め込み表。参照結果だけを GPU へ送る(TE ストリーミング時の 1.45GB 削減)。"""
+
+    def __init__(self, inner: torch.nn.Embedding, device: torch.device) -> None:
+        super().__init__()
+        self.inner = inner
+        self.device = device
+        self.weight = inner.weight  # 互換(dtype 参照など)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        return self.inner(ids.to("cpu")).to(self.device, non_blocking=True)
+
+
+class _UnusedHead(torch.nn.Module):
+    """lm_head の代わり。H3-Image は hidden_states[50] しか使わないので、呼ばれたら設計ミスとして落とす。"""
+
+    def forward(self, x):
+        raise RuntimeError("text_encoder の lm_head は不要として削除済みです(hidden_states のみ使用)")
+
+
 class Engine:
     def __init__(self, settings: Settings) -> None:
         self.s = settings
@@ -103,11 +123,13 @@ class Engine:
         t0 = time.time()
         if not (self.s.te_dir / "config.json").exists():
             raise RuntimeError(f"text_encoder キャッシュが見つかりません: {self.s.te_dir}(H3IMG_TE_DIR)")
+        stream = self.te_device == self.device and self._te_stream_enabled()
+        # ストリーミング時は最初から CPU へ読む(GPU へ全部載せてから退避すると、ロードの時点で 16GB を超える)
         te = AutoModelForImageTextToText.from_pretrained(str(self.s.te_dir), dtype=torch.bfloat16,
-                                                         device_map=str(self.te_device))
+                                                         device_map="cpu" if stream else str(self.te_device))
         if self.te_device != self.device:
             self._route_text_encoder(te)
-        elif self._te_stream_enabled():
+        elif stream:
             self._stream_text_encoder(te)
         logger.info("text_encoder loaded (%d layers) on %s in %.1fs (stream=%s)",
                     te.config.text_config.num_hidden_layers, self.te_device, time.time() - t0, self.te_streamed)
@@ -127,11 +149,16 @@ class Engine:
         """decoder 51 層を pinned CPU に退避し、forward hook で 1 層ずつ GPU へ往復させる。
 
         bnb nf4 の Params4bit は `.to()` の往復で量子化状態を保つ(hidden_states[50] が全 GPU 常駐時と
-        bit 一致することを実測済み)。embed / vision tower / norm は GPU に残す(~3GB)。
+        bit 一致することを実測済み)。GPU に残すのは vision tower / norm / RoPE の ~0.3GB。
         """
         dev = self.device
-        layers = te.model.language_model.layers
+        lm = te.model.language_model
+        layers = lm.layers
         t0 = time.time()
+        # decoder 層・埋め込み以外(vision tower、最終 norm、RoPE)だけ GPU へ
+        te.model.visual.to(dev)
+        lm.norm.to(dev)
+        lm.rotary_emb.to(dev)
         for layer in layers:
             layer.to("cpu")
             for p in layer.parameters():
@@ -146,6 +173,10 @@ class Engine:
         for layer in layers:
             layer.register_forward_pre_hook(pre, with_kwargs=True)
             layer.register_forward_hook(post)
+        # lm_head(1.45GB)は hidden_states[50] しか読まないので不要。embed_tokens(bf16 1.45GB)は
+        # 参照結果だけを GPU へ送れば済むので CPU に置く(どちらも出力は変わらない)。
+        te.lm_head = _UnusedHead()
+        lm.embed_tokens = _CpuEmbedding(lm.embed_tokens.to("cpu"), dev)
         torch.cuda.empty_cache()
         self.te_streamed = True
         logger.info("text_encoder decoder layers streamed from pinned host (%d layers, %.1fs, resident=%.2fGB)",
@@ -177,9 +208,37 @@ class Engine:
 
         t0 = time.time()
         vae = AutoencoderKLMiniMaxH3Image.from_pretrained(self._resolve_repo(), subfolder="vae_diffusers",
-                                                          torch_dtype=torch.bfloat16).to(self.device)
-        logger.info("vae loaded in %.1fs", time.time() - t0)
+                                                          torch_dtype=torch.bfloat16)
+        if self.te_streamed:
+            self._swap_vae(vae)
+        else:
+            vae.to(self.device)
+        logger.info("vae loaded in %.1fs (swap=%s)", time.time() - t0, self.te_streamed)
         return vae
+
+    def _swap_vae(self, vae) -> None:
+        """VAE(2.3GB)を pinned CPU に置き、encode / decode の間だけ GPU へ置く(TE ストリーミング時)。
+
+        参照画像付きの編集では TE が画像トークン分の活性を使うため、16GB 級では VAE が常駐していると
+        TE のエンコード中に OOM する(実測)。往復は 2.3GB で 0.1〜0.2s。
+        """
+        dev = self.device
+        vae.to("cpu")
+        for p in vae.parameters():
+            p.data = p.data.pin_memory()
+
+        def wrap(fn):
+            def inner(*args, **kwargs):
+                vae.to(dev, non_blocking=True)
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    vae.to("cpu", non_blocking=True)
+                    torch.cuda.empty_cache()
+            return inner
+
+        vae.encode = wrap(vae.encode)
+        vae.decode = wrap(vae.decode)
 
     def _load_transformer(self, steps: int):
         sigmas, tag, need_lora = STEP_PRESETS[steps]
