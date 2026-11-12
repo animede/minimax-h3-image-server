@@ -30,6 +30,17 @@ class Interrupted(RuntimeError):
     pass
 
 
+def _host_ram_gb() -> float:
+    """ホストの搭載メモリ(GB、/proc/meminfo の MemTotal)。読めなければ大きい値を返す(従来どおり pinned)。"""
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) / 2**20
+    except OSError:
+        pass
+    return 1e9
+
+
 class _CpuEmbedding(torch.nn.Module):
     """CPU 常駐の埋め込み表。参照結果だけを GPU へ送る(TE ストリーミング時の 1.45GB 削減)。"""
 
@@ -52,8 +63,10 @@ class _UnusedHead(torch.nn.Module):
 
 @dataclass(frozen=True)
 class Profile:
-    """VRAM 予算に応じた構成。need_same = TE が transformer と同じ GPU のときに要る空き(GB)、
-    need_split = TE が別 GPU のとき transformer 側に要る空き。実測 peak + 1〜1.5GB の余裕。"""
+    """VRAM 予算に応じた構成。need_same = TE が transformer と同じ GPU のときに要る量(GB)、
+    need_split = TE が別 GPU のとき transformer 側に要る量。いずれも torch の割り当て peak の実測 + 0.3GB。
+    予算は CUDA コンテキスト作成後の空きから測るのでコンテキスト分は含めない。余裕は予算側で
+    H3IMG_VRAM_RESERVE_GB として別に取る。"""
     name: str
     quant: str
     te_stream: bool
@@ -62,13 +75,16 @@ class Profile:
     need_split: float
 
 
-# 上から順に、予算が足りる最初のものを選ぶ(実測: 48gb=peak 38.4 / 32gb=30.2 / 16gb=13.1 / 8gb=実使用 4.2)
+# 上から順に、予算が足りる最初のものを選ぶ(torch peak の実測: 48gb 38.4 / 32gb 30.2 / 16gb 13.0 / 8gb 2.9)
 PROFILES: tuple[Profile, ...] = (
-    Profile("48gb", "int8wo", False, False, need_same=40.0, need_split=22.5),
-    Profile("32gb", "ck-w4a8", False, False, need_same=31.5, need_split=14.5),
-    Profile("16gb", "ck-w4a8", True, False, need_same=14.5, need_split=14.5),
-    Profile("8gb", "ck-w4a8", True, True, need_same=5.0, need_split=4.0),
+    Profile("48gb", "int8wo", False, False, need_same=38.7, need_split=21.7),
+    Profile("32gb", "ck-w4a8", False, False, need_same=30.5, need_split=13.6),
+    Profile("16gb", "ck-w4a8", True, False, need_same=13.3, need_split=13.6),
+    Profile("8gb", "ck-w4a8", True, True, need_same=3.2, need_split=3.2),
 )
+VAE_GPU_GB = 1.45               # VAE を GPU に常駐させるのに要る量(重み 1.42GB)
+TE_PINNED_MIN_HOST_GB = 48.0    # TE_HOST=auto でピン留め(速い)を選ぶホスト RAM の下限。未満は mmap(必須 RAM が約 13GB 少ない)
+EMBED_GPU_GB = 1.5              # 埋め込み表(bf16 1.45GB)を GPU に置くのに要る量
 
 
 class Engine:
@@ -109,6 +125,9 @@ class Engine:
             "te_streamed": self.te_streamed,
             "transformer_streamed": self.transformer_streamed,
             "host_pinned_gb": pruned_image.pinned_gb(),
+            "te_host": getattr(self, "te_host", None),
+            "vae_on_gpu": getattr(self, "vae_on_gpu", None),
+            "embed_on_gpu": getattr(self, "embed_on_gpu", None),
             "vram_alloc_gb": round(torch.cuda.memory_allocated(self.device) / 2**30, 2),
         }
 
@@ -170,11 +189,12 @@ class Engine:
     # -- VRAM 予算 → 構成 ----------------------------------------------------------
 
     def _vram_budget_gb(self) -> tuple[float, float, float]:
-        """(予算, 要求, 実際の空き)。予算 = min(H3IMG_VRAM_GB または総容量, 今の空き)。"""
+        """(予算, 要求, 実際の空き)。予算 = min(H3IMG_VRAM_GB または総容量, 今の空き - 予備)。
+        予備(H3IMG_VRAM_RESERVE_GB、既定 1GB)は画面表示や他のアプリのために必ず空けておく分。"""
         free, total = torch.cuda.mem_get_info(self.device)
         free_gb, total_gb = free / 2**30, total / 2**30
         requested = float(self.s.vram_gb) if self.s.vram_gb != "auto" else total_gb
-        return min(requested, free_gb), requested, free_gb
+        return min(requested, free_gb - self.s.vram_reserve_gb), requested, free_gb
 
     def _resolve_profile(self) -> Profile:
         budget, requested, free_gb = self._vram_budget_gb()
@@ -197,13 +217,22 @@ class Engine:
             te_stream = False  # TE が別 GPU ならストリーミングは不要(そちらに常駐)
         prof = Profile(chosen.name, quant, te_stream, tr_stream, chosen.need_same, chosen.need_split)
         self._cap_allocator(budget)
-        logger.info("VRAM profile: %s (budget %.1fGB = min(requested %.1f, free %.1f), TE %s) -> quant=%s te_stream=%s "
-                    "transformer_stream=%s", prof.name, budget, requested, free_gb,
-                    "split" if split else "same GPU", prof.quant, prof.te_stream, prof.transformer_stream)
+        # 予算に余りがあれば、ストリーミング構成でも VAE と埋め込み表を GPU に置く(往復とホスト RAM が減る)
+        headroom = budget - (prof.need_split if split else prof.need_same)
+        self.vae_on_gpu = not te_stream or headroom >= VAE_GPU_GB
+        if te_stream and self.vae_on_gpu:
+            headroom -= VAE_GPU_GB
+        self.embed_on_gpu = te_stream and headroom >= EMBED_GPU_GB
+        self.te_host = (self.s.te_host if self.s.te_host != "auto" else
+                        ("pinned" if _host_ram_gb() >= TE_PINNED_MIN_HOST_GB else "mmap")) if te_stream else None
+        logger.info("VRAM profile: %s (budget %.1fGB = min(requested %.1f, free %.1f - reserve %.1f), TE %s) -> quant=%s "
+                    "te_stream=%s(%s) transformer_stream=%s vae_on_gpu=%s embed_on_gpu=%s", prof.name, budget, requested,
+                    free_gb, self.s.vram_reserve_gb, "split" if split else "same GPU", prof.quant, prof.te_stream,
+                    self.te_host, prof.transformer_stream, self.vae_on_gpu, self.embed_on_gpu)
         return prof
 
     def _cap_allocator(self, budget_gb: float) -> None:
-        """PyTorch のキャッシングアロケータが予約できる量を予算 - 1GB(CUDA コンテキスト分)に制限する。
+        """PyTorch のキャッシングアロケータが予約できる量を予算に制限する(予算はコンテキスト作成後の空き - 予備)。
 
         先読み(record_stream)は解放が計算の完了まで遅れるので、上限が無いとアロケータは空いている VRAM を
         全部予約してしまう(実測: 空き 7.3GB の GPU で割り当て 3.1GB に対しプロセスが 7.3GB を占有)。
@@ -211,7 +240,7 @@ class Engine:
         予算が GPU 全体と同じ(既定の auto で空いている大きい GPU)ならほぼ無制限のまま。
         """
         total_gb = torch.cuda.get_device_properties(self.device).total_memory / 2**30
-        frac = min(1.0, max(0.05, (budget_gb - 1.0) / total_gb))
+        frac = min(1.0, max(0.05, budget_gb / total_gb))
         torch.cuda.set_per_process_memory_fraction(frac, self.device)
         logger.info("allocator cap: %.1fGB (budget %.1fGB)", frac * total_gb, budget_gb)
 
@@ -237,16 +266,22 @@ class Engine:
         lm.rotary_emb.to(dev)
         # 先読みはしない: TE は 1 回しか通らず、先読みの効果は実測で 0.1s 程度(誤差の範囲)。先読みすると
         # record_stream で解放が遅れ、アロケータの予約が膨らむ(8gb 構成で 4.2GB → 6.6GB)。
-        pruned_image.stream_layers(lm.layers, dev, owner="te", prefetch=False)
+        # te_host == "mmap": 原本は safetensors の mmap(ページキャッシュ)のまま。ピン留めしないので必須の RAM が
+        # 約 13GB 減る(OS が回収できるメモリになる)。"pinned": cudaHostRegister でピン留めした原本(速いが常に使う)。
+        pruned_image.stream_layers(lm.layers, dev, owner="te", prefetch=False, pin=self.te_host == "pinned")
         te.lm_head = _UnusedHead()
         emb = lm.embed_tokens
-        emb.weight = nn.Parameter(emb.weight.detach().to("cpu").clone(), requires_grad=False)
-        lm.embed_tokens = _CpuEmbedding(emb, dev)
+        if self.embed_on_gpu:
+            emb.to(dev)
+        else:
+            if self.te_host == "pinned":   # mmap から切り離す(pinned 方式ではファイルのマップを残さない)
+                emb.weight = nn.Parameter(emb.weight.detach().to("cpu").clone(), requires_grad=False)
+            lm.embed_tokens = _CpuEmbedding(emb, dev)
         torch.cuda.empty_cache()
         self.te_streamed = True
-        logger.info("text_encoder decoder layers streamed from pinned host (%d layers, %.1fs, resident=%.2fGB, "
-                    "pinned=%s)", len(lm.layers), time.time() - t0,
-                    torch.cuda.memory_allocated(dev) / 2**30, pruned_image.pinned_gb())
+        logger.info("text_encoder decoder layers streamed from %s (%d layers, %.1fs, resident=%.2fGB, embed_on_gpu=%s, "
+                    "pinned=%s)", self.te_host, len(lm.layers), time.time() - t0,
+                    torch.cuda.memory_allocated(dev) / 2**30, self.embed_on_gpu, pruned_image.pinned_gb())
 
     def _route_text_encoder(self, te) -> None:
         """te.model.forward を包み、入力を TE 側 GPU へ、hidden_states[50] だけをホスト経由で返す。"""
@@ -275,11 +310,12 @@ class Engine:
         t0 = time.time()
         vae = AutoencoderKLMiniMaxH3Image.from_pretrained(self._resolve_repo(), subfolder="vae_diffusers",
                                                           torch_dtype=torch.bfloat16)
-        if self.te_streamed:
+        swap = not self.vae_on_gpu
+        if swap:
             self._swap_vae(vae)
         else:
             vae.to(self.device)
-        logger.info("vae loaded in %.1fs (swap=%s)", time.time() - t0, self.te_streamed)
+        logger.info("vae loaded in %.1fs (swap=%s)", time.time() - t0, swap)
         return vae
 
     def _swap_vae(self, vae) -> None:

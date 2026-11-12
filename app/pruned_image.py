@@ -296,7 +296,7 @@ def to_host(masters: list) -> None:
         _set(sl, pinned)
 
 
-def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = True) -> None:
+def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = True, pin: bool = True) -> None:
     """layers(順に呼ばれる層の列)をピン留めした原本に置き、forward hook で 1 つずつ GPU へ流す。
     層 i の計算中に i+1 を別 stream で先読みする。
 
@@ -306,7 +306,9 @@ def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = Tru
     masters = []
     for layer in layers:
         layer.to("cpu")
-        masters.append(pin_module(layer, owner))
+        # pin=False: 今の CPU テンソル(safetensors の mmap ならページキャッシュ)をそのまま原本にする。
+        # ピン留めしないのでコピーは同期的になるが、OS が回収できるメモリで済む。
+        masters.append(pin_module(layer, owner) if pin else [(sl, _get(sl)) for sl in _slots(layer)])
     n = len(masters)
     if not prefetch:
         # 先読みなし: 計算と同じ stream でコピーする。解放はストリーム順序で守られるので record_stream が要らず、
