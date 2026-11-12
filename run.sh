@@ -5,4 +5,6 @@ set -euo pipefail
 cd "$(dirname "$0")"
 PORT="${H3IMG_PORT:-8633}"
 HOST="${H3IMG_HOST:-127.0.0.1}"
+# ブロックストリーミング時の reserved 膨張を抑える(実測 6.8GB → 4.2GB)。明示指定があればそれを尊重
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 exec .venv/bin/python -m uvicorn app.main:app --host "$HOST" --port "$PORT"

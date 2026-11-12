@@ -80,6 +80,7 @@ class Engine:
             "te_device": str(self.te_device),
             "te_loaded": self.te is not None,
             "te_streamed": self.te_streamed,
+            "transformer_streamed": self.transformer_streamed,
             "vram_alloc_gb": round(torch.cuda.memory_allocated(self.device) / 2**30, 2),
         }
 
@@ -136,6 +137,13 @@ class Engine:
         return te
 
     te_streamed: bool = False
+    transformer_streamed: bool = False
+
+    def _transformer_stream_enabled(self) -> bool:
+        if self.s.transformer_stream in ("0", "1"):
+            return self.s.transformer_stream == "1"
+        total_gb = torch.cuda.get_device_properties(self.device).total_memory / 2**30
+        return total_gb < self.s.transformer_stream_auto_below_gb
 
     def _te_stream_enabled(self) -> bool:
         if self.s.te_stream == "1":
@@ -252,8 +260,11 @@ class Engine:
         t0 = time.time()
         quant = self.s.transformer_quant
         cache_name = {"int8wo": "int8wo_adaln_table", "ck-w4a8": "ckw4a8_adaln_table"}[quant] + tag
+        stream = self._transformer_stream_enabled()
         tr = pruned_image.load_transformer(self._resolve_repo(), self.pipe, self.device,
-                                           self.s.cache_dir / cache_name, quant=quant, lora_path=lora)
+                                           self.s.cache_dir / cache_name, quant=quant, lora_path=lora,
+                                           stream_blocks=stream)
+        self.transformer_streamed = stream
         self._install_progress_hook(tr, steps)
         logger.info("transformer (steps=%d) ready in %.1fs, alloc=%.2fGB", steps, time.time() - t0,
                     torch.cuda.memory_allocated(self.device) / 2**30)

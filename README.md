@@ -2,8 +2,9 @@
 
 [MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)(33B、静止画生成 +
 最大 16 枚参照の編集)を **約 21GB の VRAM で、1024² を 1.8 秒・2048² を 4.1 秒**で動かす
-単独の画像サーバ + ブラウザ UI です。**W4A8 量子化 + text_encoder の層ストリーミングで 16GB 1 枚でも動きます**
-(peak 12.5〜13.1GB、1024² 2.6 秒・2048² 4.1 秒・2048² 級の編集 7.3 秒)。diffusers(main)ベース、コードは MIT ライセンス。
+単独の画像サーバ + ブラウザ UI です。**W4A8 量子化 + text_encoder の層ストリーミングで 16GB 1 枚でも動き、さらに transformer の
+ブロックストリーミングで 8GB 級でも動きます**(実使用 4.2GB、1024² 2.6〜3.1 秒・2048² 4.2 秒・2048² 級の編集 7.7 秒。
+出力は常駐時とピクセル一致)。diffusers(main)ベース、コードは MIT ライセンス。
 
 - 本家の bf16 は transformer 66GB + text_encoder 66.7GB で 80GB GPU にも同時に載りませんが、
   本サーバは **AdaLN 射影の事前計算テーブル(bit 一致・近似なし)+ int8 重み量子化 + nf4 text_encoder**で
@@ -13,6 +14,8 @@
   (GEMM は int8 より速い)、text_encoder の 51 層を pinned ホスト RAM から 1 層ずつ流し、未使用の lm_head を
   捨て、埋め込み表を CPU に置いて常駐 ~0.3GB にする(出力は全 GPU 常駐時と bit 一致)。VAE も encode / decode
   の間だけ GPU に置く。**32GB 1 枚で peak ~29GB、16GB 1 枚で peak ~13GB**。
+- さらに `H3IMG_TRANSFORMER_STREAM=1`(15GB 未満の GPU で自動)で transformer の 50 ブロックも pinned ホスト RAM から
+  先読みしながら流し、**8GB 級(実使用 4.2GB)**まで下がる。先読みが効くので速度は 16GB 構成と同じ。
 - 非同期ジョブ API と、生成・参照編集・履歴・ダウンロード・削除ができる UI。
 
 ## 目次
@@ -40,10 +43,10 @@
 | 2 枚(int8wo) | GPU0 **24GB 級**(transformer)+ GPU1 **20GB 以上**(TE) | 既定(2 枚あれば自動) |
 | 1 枚(W4A8) | **32GB 級**: peak 29.1GB(2048²)/ 30.2GB(2048² 編集) | `H3IMG_TRANSFORMER_QUANT=ck-w4a8 H3IMG_TE_STREAM=0` |
 | 1 枚(W4A8 + TE ストリーミング) | **16GB 級**: peak 12.5GB(1024²)/ 12.6GB(2048²)/ 13.1GB(1664×2496 編集) | `H3IMG_TRANSFORMER_QUANT=ck-w4a8`(TE ストリーミングは 40GB 未満の GPU で自動 ON) |
+| 1 枚(上記 + transformer ブロックストリーミング) | **8GB 級**: torch peak 2.4GB(2048²)/ 2.9GB(編集)、nvidia-smi のプロセス実使用 max 4.2GB | `H3IMG_TRANSFORMER_QUANT=ck-w4a8`(ブロックストリーミングは 15GB 未満の GPU で自動 ON)。ホスト RAM +31GB |
 
-W4A8 の 2 構成は GPU の空きを 23.5GB / 15.5GB に制限した RTX PRO 6000(sm_120)で検証した値です(本物の
-16GB / 24GB / 32GB カードでは未検証。12GB 級は transformer 10.7GB 自体が壁で、ブロック単位のストリーミングが
-別途必要。カーネルは Triton/CUDA 実装なので他世代でも動く見込みですが確認していません)。
+W4A8 の 3 構成は GPU の空きを 23.5GB / 15.5GB / 7.3GB に制限した RTX PRO 6000(sm_120)で検証した値です
+(本物の 8〜32GB カードでは未検証。カーネルは Triton/CUDA 実装なので他世代でも動く見込みですが確認していません)。
 
 ホスト RAM: 量子化キャッシュがある状態では数 GB。初回のキャッシュ構築も bf16 を 1 テンソルずつ扱うため
 大きな RAM は要りません(実測ピーク +数 GB)。ディスクは [導入](#導入) 参照。
@@ -63,14 +66,14 @@ RTX PRO 6000 Blackwell(96GB、transformer)+ RTX PRO 5000 Blackwell(48GB、text_e
 
 W4A8 構成(`ck-w4a8`、3 step、TE も同じ GPU):
 
-| ケース | 32GB 構成(TE 常駐) | 16GB 構成(TE ストリーミング + VAE スワップ) |
-|---|---|---|
-| T2I 1024² | 0.7s | 2.6s |
-| T2I 2048² | 2.8s | 4.1s |
-| 参照編集 1024×1536(参照 1 枚) | — | 5.0s |
-| 参照編集 1664×2496(参照 1 枚) | 5.6s | 7.3s |
-| T2I 2048² 6 step | — | 6.1s(24GB 相当で測定) |
-| peak VRAM | 28.7〜30.2GB | 12.5〜13.1GB |
+| ケース | 32GB 構成(TE 常駐) | 16GB 構成(TE ストリーミング + VAE スワップ) | 8GB 構成(+ ブロックストリーミング) |
+|---|---|---|---|
+| T2I 1024² | 0.7s | 2.6s | 2.6〜3.1s |
+| T2I 2048² | 2.8s | 4.1s | 4.2s |
+| 参照編集 1024×1536(参照 1 枚) | — | 5.0s | — |
+| 参照編集 1664×2496(参照 1 枚) | 5.6s | 7.3s | 7.7s |
+| T2I 2048² 6 step | — | 6.1s(24GB 相当で測定) | — |
+| peak VRAM(torch) | 28.7〜30.2GB | 12.5〜13.1GB | 2.4〜2.9GB(プロセス実使用 max 4.2GB) |
 
 W4A8 は int8wo より **GEMM が速い**(2048² で 4.1s → 2.8s)ので、TE ストリーミングの +1.1s を足しても
 int8wo と同程度です。品質は同一 seed で int8wo と並べて目視した範囲では同等でした(細部は seed 相当に
@@ -193,6 +196,7 @@ OpenAI 互換の LLM(例: llama.cpp server の gemma 系)に送り、短い日�
 | `H3IMG_HOST` / `H3IMG_PORT` | 127.0.0.1 / 8633 | 待ち受けアドレスとポート |
 | `H3IMG_STEPS` | 3 | 既定ステップ(2 / 3 / 6) |
 | `H3IMG_TRANSFORMER_QUANT` | int8wo | transformer の量子化。`ck-w4a8` で ~11GB(32GB / 24GB 構成) |
+| `H3IMG_TRANSFORMER_STREAM` | auto | transformer 50 ブロックのストリーミング(8GB 級向け)。auto = GPU が 15GB 未満なら ON(`H3IMG_TRANSFORMER_STREAM_AUTO_BELOW_GB`)。ck-w4a8 と併用 |
 | `H3IMG_TE_STREAM` | auto | text_encoder の層ストリーミング(+ lm_head 削除・埋め込み CPU 化・VAE スワップ)。auto = TE と transformer が同じ GPU で、その GPU が 40GB 未満なら ON(`H3IMG_TE_STREAM_AUTO_BELOW_GB`) |
 | `H3IMG_DEVICE` / `H3IMG_TE_DEVICE` | cuda:0 /(2 枚あれば cuda:1) | transformer / text_encoder の配置先 |
 | `H3IMG_GENERATION_AREA` | requested | 既定キャンバス(`native` = 最低 4MP) |
@@ -208,7 +212,7 @@ OpenAI 互換の LLM(例: llama.cpp server の gemma 系)に送り、短い日�
 
 本家は transformer 66GB(bf16)+ text_encoder 66.7GB(bf16)で、80GB GPU でも両方は載りません。
 本サーバは次の 5 つを組み合わせて、transformer 側 ~19GB・text_encoder ~17GB に収め、6 step で 1.5 倍、
-3 step で 2 倍以上速くしています。さらに 6・7 で 32GB / 16GB の 1 枚構成に対応します。
+3 step で 2 倍以上速くしています。さらに 6・7・8 で 32GB / 16GB / 8GB の 1 枚構成に対応します。
 各項目の数字は実測(RTX PRO 6000、1024² / 2048²)。
 
 ### 1. AdaLN 射影を「事前計算テーブル」に置き換える(VRAM −26GB、誤差ゼロ)
@@ -300,6 +304,20 @@ GPU へ往復させます。bitsandbytes の nf4 パラメータは `.to()` の�
 エンコードは 0.12s → 1.3s(+1.1s / 生成)ですが、プロンプトは 1 回しか通らないので、生成全体では 16GB 構成
 でも int8wo(48GB 構成)と同程度の速度です。ホスト RAM を +20GB 使います。
 
+### 8. transformer の 50 ブロックを先読みしながら流す(常駐 11GB → 1GB、8GB 級向け)
+
+`H3IMG_TRANSFORMER_STREAM=1`(15GB 未満の GPU では自動)。W4A8 化した transformer_blocks(各 ~0.2GB)を
+pinned ホスト RAM に置き、forward hook でブロック i の計算中に i+1 を別の CUDA stream でコピーします。
+GPU に残るのは token refiner・入出力射影などの ~1GB。コピーが計算に隠れるので、**速度は 16GB 構成と同じ**
+(2048² 4.2s)、出力は常駐時と**ピクセル一致**です。ホスト RAM は TE と合わせて +31GB 使います。
+
+- 重みは書き換わらないので GPU → CPU の書き戻しはしません。pre hook で GPU へコピーした tensor を
+  `param.data` に差し、post hook で pinned のマスターへ戻すだけです。
+- 罠: 先読みは別 stream で行うため、GPU 側の tensor を解放するときに `record_stream(計算 stream)` を付けないと、
+  計算が終わる前にアロケータがその領域を次の先読みに使い回し、**出力が真っ黒になります**(実測)。
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`(run.sh で既定)で reserved の膨張を抑えます
+  (プロセス実使用 6.8GB → 4.2GB)。
+
 ### 試して採らなかったこと
 
 | 案 | 結果 |
@@ -322,6 +340,8 @@ GPU へ往復させます。bitsandbytes の nf4 パラメータは `.to()` の�
 W4A8 構成: transformer ck-w4a8 ~10.7 + テーブル等 0.5 + VAE 2.3 + 活性 → **~13〜14GB**。
 TE を同じ GPU に常駐させると +16.3GB(peak 29.1GB、32GB 級)。層ストリーミング + lm_head 削除 +
 埋め込み CPU 化 + VAE スワップなら TE 分は +0.3〜0.9GB で **peak 12.5〜13.1GB(16GB 級)**。
+transformer のブロックストリーミングを足すと transformer 分が ~1GB + 先読み 2 ブロックになり **torch peak 2.4〜2.9GB、
+プロセス実使用 4.2GB(8GB 級)**。
 
 ## ライセンスの注意
 
@@ -408,8 +428,10 @@ kernels, ~11GB, faster GEMM than int8) and the 51 text-encoder layers are stream
 host RAM (resident ~0.3GB after dropping the unused lm_head and keeping the embedding table on CPU;
 bit-exact output), and the VAE is moved to the GPU only for encode/decode, so the whole model runs on a
 **single 32GB GPU (peak ~29GB) or a single 16GB GPU (peak 12.5–13.1GB)** at 2.6s @1024² / 4.1s @2048² /
-7.3s for a 1664×2496 reference edit (verified on a 96GB GPU with free memory capped at 15.5GB; real
-16GB/24GB/32GB cards not tested yet).
+7.3s for a 1664×2496 reference edit. With `H3IMG_TRANSFORMER_STREAM=1` the 50 transformer blocks are also
+prefetched from pinned host RAM on a side stream (pixel-identical output, same speed), bringing the process
+footprint down to **4.2GB, i.e. an 8GB GPU** (all verified on a 96GB GPU with free memory capped at
+15.5GB / 7.3GB; real 8–32GB cards not tested yet).
 How: (1) the AdaLN projections only depend on the (fixed) sampling timesteps, so their outputs are
 precomputed into a 68MB table with bit-exact results (−26GB); (2) the remaining 312 linears are int8
 weight-only, quantized shard-by-shard without materializing bf16 (−21GB, 1.6× faster than bnb LLM.int8);

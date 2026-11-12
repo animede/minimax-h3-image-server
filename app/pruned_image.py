@@ -67,7 +67,7 @@ class AdaLNTable(nn.Module):
     def forward(self, temb: torch.Tensor) -> tuple[torch.Tensor, ...]:
         if self.rows is None:
             raise RuntimeError("AdaLNTable.rows が未設定です(transformer.forward のラッパー経由で呼ぶこと)")
-        out = self.table.index_select(0, self.rows).view(-1, 6 * self.hidden_size)
+        out = self.table.index_select(0, self.rows.to(self.table.device)).view(-1, 6 * self.hidden_size)
         return out.chunk(6, dim=-1)
 
 
@@ -197,6 +197,60 @@ class CKW4A8Linear(nn.Linear):
         return y.reshape(*shape[:-1], y.shape[-1])
 
 
+def install_block_streaming(tr, device: torch.device) -> None:
+    """transformer_blocks(50 個、ck-w4a8 で各 ~0.2GB)を pinned CPU に置き、forward hook で 1 ブロックずつ
+    GPU へ流す(12GB 級以下向け)。次のブロックは別 stream で先読みする。
+
+    重みは書き換わらないので GPU → CPU の書き戻しはしない: pinned CPU のマスターを保持し、pre hook で
+    GPU へコピーした tensor を `param.data` に差し、post hook でマスターに戻すだけ(GPU 側は解放)。
+    先読みは copy stream 上で行うので、GPU tensor に `record_stream(計算 stream)` を付けて、計算が終わる前に
+    アロケータがその領域を次の先読みに再利用しないようにする(これを欠くと出力が黒画像になる、実測)。
+    """
+    blocks = tr.transformer_blocks
+    masters: list[list[tuple[torch.Tensor, torch.Tensor]]] = []  # block ごとの [(param_or_buffer, pinned)]
+    for b in blocks:
+        b.to("cpu")
+        entries = []
+        for t in list(b.parameters()) + list(b.buffers()):
+            t.data = t.data.pin_memory()
+            entries.append((t, t.data))
+        masters.append(entries)
+    n = len(blocks)
+    copy_stream = torch.cuda.Stream(device)
+    events: list[torch.cuda.Event | None] = [None] * n
+    compute = torch.cuda.current_stream(device)
+
+    def prefetch(i: int) -> None:
+        with torch.cuda.stream(copy_stream):
+            for t, pinned in masters[i]:
+                g = pinned.to(device, non_blocking=True)
+                g.record_stream(compute)
+                t.data = g
+            ev = torch.cuda.Event()
+            ev.record(copy_stream)
+            events[i] = ev
+
+    def make_pre(i: int):
+        def pre(mod, args, kwargs):
+            if events[i] is None:
+                prefetch(i)
+            compute.wait_event(events[i])
+            events[i] = None
+            if i + 1 < n:
+                prefetch(i + 1)
+        return pre
+
+    def make_post(i: int):
+        def post(mod, args, out):
+            for t, pinned in masters[i]:
+                t.data = pinned  # GPU 側は record_stream により計算完了後に解放される
+        return post
+
+    for i, b in enumerate(blocks):
+        b.register_forward_pre_hook(make_pre(i), with_kwargs=True)
+        b.register_forward_hook(make_post(i))
+
+
 def _replace_quant_targets_with_ck_shells(tr) -> None:
     """キャッシュ再ロード用: 量子化対象の nn.Linear(meta)を CKW4A8Linear(meta)へ置換する。"""
     for name, mod in list(tr.named_modules()):
@@ -223,7 +277,7 @@ def load_lora_pairs(lora_path: str) -> tuple[dict[str, tuple[torch.Tensor, torch
 
 
 def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: bool = True,
-                quant: str = "int8wo", lora_path: str | None = None):
+                quant: str = "int8wo", lora_path: str | None = None, stream_blocks: bool = False):
     """bf16 シャードから量子化済み transformer を組み立てる(1 テンソルずつ GPU へ)。
 
     quant="int8wo": torchao Int8WeightOnly(キャッシュ可。eager では bf16 へ逆量子化してから
@@ -287,7 +341,8 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
                             assert torch.equal(ref, table), "AdaLN テーブルが元の射影と bit 一致しません"
                             verified = True
                             del lin
-                        _replace_adaln(tr, bi, AdaLNTable(keys.clone(), table, hidden))
+                        tab = AdaLNTable(keys.clone(), table, hidden)
+                        _replace_adaln(tr, bi, tab.to("cpu") if stream_blocks else tab)
                         del pending_adaln[bi], slot
                 elif _is_quant_target(name):
                     mod_name = name.rsplit(".", 1)[0]
@@ -300,7 +355,10 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
                     if quant == "bnb-int8":
                         _set_module(tr, mod_name, _bnb_int8_linear(w.cpu() if w.is_cuda else w, device))
                     elif quant == "ck-w4a8":
-                        _set_module(tr, mod_name, CKW4A8Linear.from_weight(w, device))
+                        lin = CKW4A8Linear.from_weight(w, device)
+                        if stream_blocks and mod_name.startswith("transformer_blocks."):
+                            lin = lin.to("cpu")  # ブロックは GPU に溜めない(12GB 級ではビルド中に溢れる)
+                        _set_module(tr, mod_name, lin)
                         del w
                     else:
                         _assign(tr, name, device, w)
@@ -314,6 +372,8 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
         if buf.device != device:
             mod_name, _, attr = name.rpartition(".")
             dict(tr.named_modules())[mod_name].register_buffer(attr, buf.to(device), persistent=False)
+    if stream_blocks:
+        install_block_streaming(tr, device)
     torch.cuda.empty_cache()
     install_forward_wrapper(tr)
     tr.eval()
@@ -339,7 +399,7 @@ def save_cache(tr, cache_dir: Path) -> None:
     logger.info("cache saved: %s (%.1fGiB)", cache_dir, size)
 
 
-def load_cache(cache_dir: Path, device: torch.device):
+def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = False):
     from accelerate import init_empty_weights
     from diffusers import MiniMaxH3ImageTransformer2DModel as Cls
 
@@ -356,7 +416,13 @@ def load_cache(cache_dir: Path, device: torch.device):
         _replace_adaln(tr, i, AdaLNTable(sd[k + "keys"], sd[k + "table"], hidden))
     # 量子化済み Linear は meta の nn.Parameter(bf16)に Int8Tensor を assign で差し替える。
     tr.load_state_dict(sd, assign=True)
-    tr = tr.to(device)
+    if stream_blocks:
+        for name, child in tr.named_children():
+            if name != "transformer_blocks":
+                child.to(device)
+        install_block_streaming(tr, device)
+    else:
+        tr = tr.to(device)
     install_forward_wrapper(tr)
     tr.eval()
     logger.info("cache loaded: %s %.1fs alloc=%.2fGB", cache_dir, time.time() - t0,
@@ -365,20 +431,22 @@ def load_cache(cache_dir: Path, device: torch.device):
 
 
 def load_transformer(repo: str, pipe, device: torch.device, cache_dir: Path, quant: str = "int8wo",
-                     lora_path: str | None = None):
+                     lora_path: str | None = None, stream_blocks: bool = False):
     """キャッシュがあれば読む、無ければ構築して保存する(bnb-int8 は毎回構築)。"""
     keys = timestep_keys(pipe)
     logger.info("AdaLN timestep keys: %s", keys.tolist())
     if quant == "bnb-int8":
-        return build_fresh(repo, device, keys, verify=True, quant=quant, lora_path=lora_path)
+        return build_fresh(repo, device, keys, verify=True, quant=quant, lora_path=lora_path,
+                           stream_blocks=stream_blocks)
     if (cache_dir / STATE_FILENAME).exists():
-        tr = load_cache(cache_dir, device)
+        tr = load_cache(cache_dir, device, stream_blocks=stream_blocks)
         cached = next(m for m in tr.modules() if isinstance(m, AdaLNTable)).keys.cpu()
         if not torch.equal(cached, keys):
             raise RuntimeError(f"キャッシュの時刻集合 {cached.tolist()} が現在の {keys.tolist()} と異なります。"
                                f"{cache_dir} を削除して作り直してください")
         return tr
-    tr = build_fresh(repo, device, keys, verify=True, quant=quant, lora_path=lora_path)
+    tr = build_fresh(repo, device, keys, verify=True, quant=quant, lora_path=lora_path,
+                     stream_blocks=stream_blocks)
     save_cache(tr, cache_dir)
     return tr
 
