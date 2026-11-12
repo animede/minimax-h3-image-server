@@ -87,6 +87,8 @@ class Settings:
     llm_model: str = _env("H3IMG_LLM_MODEL", "")
     llm_api_key: str = _env("H3IMG_LLM_API_KEY", "")
     llm_timeout_s: float = float(_env("H3IMG_LLM_TIMEOUT_S", "180"))
+    # プロンプト拡張で本家 GitHub の prompt-writing skill のガイド(references/t2i-en.txt / edit-en.txt)も system に足す
+    enhance_skill_guide: bool = _env("H3IMG_ENHANCE_SKILL_GUIDE", "1") == "1"
     cache_tags: dict = field(default_factory=lambda: {k: v[1] for k, v in STEP_PRESETS.items()})
     # 個別上書き(未指定なら models_dir 配下。__post_init__ で解決)
     te_dir: Path = field(default_factory=lambda: Path())

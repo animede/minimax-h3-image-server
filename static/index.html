@@ -91,8 +91,8 @@ let refs = []; // {id, name, url}
 let currentJob = null;
 
 const TIPS = {
-  t2i: "<b>書き方:</b> 画像全体を 1 段落で具体的に。文字・固有名詞・数・左右は正確に。人物の向きはカメラ基準(正面/背面/左向き…)で。ムード語より見える手がかりを。",
-  edit: "<b>書き方:</b> 参照はアップロード順に &lt;Picture 1&gt; &lt;Picture 2&gt;…。「&lt;Picture 1&gt; の〜は保持」→「〜を変える」→「完成後の画像」の順に。保持する要素は見えている事実に忠実に、変更部分だけ具体的に。",
+  t2i: "<b>書き方(本家 skill):</b> ①何の画像で何のためか → 主役とその状態 → スタイルの順。②配置を先に(主役の数・位置・視点・余白)。③画像に出す文字は<b>全文を引用符で</b>、位置と大小も。文字を出さないなら「The image contains no text, letters or numbers.」と書く。④「高級感」ではなく色・素材・光・質感で。英語 1〜数段落。",
+  edit: "<b>書き方(本家 skill):</b> 参照はアップロード順に &lt;Picture 1&gt;, &lt;Picture 2&gt;…。①「The red cup on the left in &lt;Picture 1&gt; is &lt;Subject 1&gt;.」のように定義 → ②「The target image shows …」と完成形、各 Subject を「fully preserved / 部分保持(何が残り何が変わるか)/ 色だけ転写」で明示 → ③変わる部分だけ具体的に(消すなら跡地に何があるか)。1 段落・英語。",
 };
 function updateTip() { $("prompt-tip").innerHTML = TIPS[$("mode").value] || TIPS.t2i; }
 $("mode").addEventListener("change", () => { $("refbox").hidden = $("mode").value !== "edit"; updateTip(); });

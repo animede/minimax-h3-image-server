@@ -28,6 +28,12 @@ from .config import Settings
 logger = logging.getLogger("h3image.enhance")
 
 PE_REPO = "MiniMaxAI/MiniMax-H3-Image-PE"
+# 本家 GitHub の prompt-writing skill(2026-11-11 公開)。t2i / edit のガイド本文を PE ルールの補足として system に足す
+SKILL_RAW_BASE = "https://raw.githubusercontent.com/MiniMax-AI/MiniMax-H3-Image/main/skills/h3-image-prompt-writing/"
+SKILL_FILES = {
+    "skill_t2i": "references/t2i-en.txt",
+    "skill_edit": "references/edit-en.txt",
+}
 PE_FILES = {
     "t2i_system": "prompt/t2i/system_prompt.txt",
     "t2i_task": "prompt/t2i/task_prompt.txt",
@@ -77,27 +83,50 @@ class PromptEnhancer:
     def _text(self, key: str) -> str:
         if key in self._texts:
             return self._texts[key]
-        rel = PE_FILES[key]
-        local = self.prompt_dir / rel
-        if not local.exists():
-            from huggingface_hub import hf_hub_download
+        if key in SKILL_FILES:
+            rel = SKILL_FILES[key]
+            local = self.prompt_dir / "skill" / rel
+            if not local.exists():
+                local.parent.mkdir(parents=True, exist_ok=True)
+                res = httpx.get(SKILL_RAW_BASE + rel, timeout=30.0, follow_redirects=True)
+                res.raise_for_status()
+                local.write_text(res.text, encoding="utf-8")
+                logger.info("skill guide fetched: %s", rel)
+        else:
+            rel = PE_FILES[key]
+            local = self.prompt_dir / rel
+            if not local.exists():
+                from huggingface_hub import hf_hub_download
 
-            local.parent.mkdir(parents=True, exist_ok=True)
-            src = hf_hub_download(PE_REPO, rel)
-            local.write_bytes(Path(src).read_bytes())
-            logger.info("PE prompt file fetched: %s", rel)
+                local.parent.mkdir(parents=True, exist_ok=True)
+                src = hf_hub_download(PE_REPO, rel)
+                local.write_bytes(Path(src).read_bytes())
+                logger.info("PE prompt file fetched: %s", rel)
         self._texts[key] = local.read_text(encoding="utf-8")
         return self._texts[key]
+
+    def _skill_guide(self, key: str) -> str | None:
+        """公式 skill のガイド(任意)。取得できなければ PE ルールだけで続行する。"""
+        if not self.s.enhance_skill_guide:
+            return None
+        try:
+            return self._text(key)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("skill guide %s を取得できません(PE ルールのみで続行): %s", key, exc)
+            return None
 
     # -- リクエスト組み立て ------------------------------------------------------
 
     def build_t2i(self, prompt: str) -> tuple[list[dict], list[str]]:
         system = self._text("t2i_system").rstrip("\n")
         template = self._text("t2i_task")
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": template.format(prompt)},
-        ]
+        messages = [{"role": "system", "content": system}]
+        guide = self._skill_guide("skill_t2i")
+        if guide:
+            messages.append({"role": "system", "content":
+                             "Additional writing guide from the official MiniMax-H3-Image prompt-writing skill. "
+                             "Follow it when writing expanded_caption; the output format above is unchanged.\n\n" + guide})
+        messages.append({"role": "user", "content": template.format(prompt)})
         return messages, ["expanded_caption", "aspect_ratio"]
 
     def build_edit(self, prompt: str, image_paths: list[Path],
@@ -119,7 +148,13 @@ class PromptEnhancer:
         parts.append({"type": "text", "text": (
             f"User Editing Instruction (JSON string): {json.dumps(prompt, ensure_ascii=False)}\n"
             f"User Aspect Ratio Selection: {aspect_ratio or 'adaptive'}")})
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": parts}]
+        messages = [{"role": "system", "content": system}]
+        guide = self._skill_guide("skill_edit")
+        if guide:
+            messages.append({"role": "system", "content":
+                             "Additional writing guide from the official MiniMax-H3-Image prompt-writing skill. "
+                             "Follow it when writing expanded_caption; the output format above is unchanged.\n\n" + guide})
+        messages.append({"role": "user", "content": parts})
         return messages, ["expanded_caption", "target_aspect_ratio"]
 
     # -- 実行 ------------------------------------------------------------------

@@ -217,34 +217,61 @@ API(非同期ジョブ方式):
 
 ## プロンプトの書き方(本家の方針)
 
-本家は「**画像全体の詳細な英語の記述**」を期待します。公式 API は短い指示を `H3-Image-Context-IR` で拡張してから
-生成しており、その拡張ルールはプロンプト拡張モデル [MiniMaxAI/MiniMax-H3-Image-PE](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image-PE)
-同梱の `prompt/t2i/task_prompt.txt` / `prompt/edit/task_prompt.txt` に書かれています。要点:
+本家は「**画像全体の詳細な英語の記述**」を期待します。2026-11-11 に本家 GitHub へ
+[prompt-writing skill](https://github.com/MiniMax-AI/MiniMax-H3-Image/tree/main/skills/h3-image-prompt-writing)
+(`SKILL.md` + `references/t2i-en.txt` / `edit-en.txt`、Claude Code 等のエージェント向け)が公開され、書き方の
+ルールと完成例がまとまっています。以下はその要点(本サーバのような自前デプロイは API と違って拡張を挟まないので、
+このルールで書いたプロンプトがそのまま入力になります)。
 
-**テキストから生成(t2i)**
-- 「写真・情景」か「情報設計物(ポスター・カード・UI・図表)」かをまず決める。後者は見出し・ラベル・凡例・単位まで
-  入った完成した構成として書く。
-- 固有名詞・文字・数・順序・左右上下・スタイルは一字一句保持。文字を出すなら「どこに書かれているか」まで。
-- 言葉を増やすのではなく「見て確認できる内容」を増やす。dramatic / cinematic のようなムード語は具体的に見える手がかりに。
-- 人物の向きはカメラ基準で明示(正面 / 背面 / 左向き / 右向き / 斜め)。手の接触・持ち物は「どちらの手が何に」まで。
-- 主要人物の数は要求どおり。出力は 1 段落の流れる英文。
+**共通のルール**
+- **用途が先、スタイルは後**: 何の画像で何のためか → 主役とその状態・動作 → 最後にスタイル。
+- **配置が先、細部は後**: 主役の数・位置・視点・余白を先に。密な内容は「上に見出し、左に写真、右に 3 段落」のように
+  領域を名付けてから中身を埋める。
+- **スタイルは見える細部で**: 「高級感」「cinematic」ではなく、色・素材・光・質感(「柔らかいサイド光、ヘアライン仕上げの
+  金属の反射、たっぷりの余白」)。
+- **画像に出る文字は全文を引用符で**: 言語・空白はそのまま、位置・大小の階層・改行も書く。コピーを作らせたい時は
+  実際の文言を書く。
+- **文字を出さないなら明示**: t2i では "The image contains no text, letters or numbers." を足す(勝手なタイトルや
+  飾り文字を防ぐ)。編集では「他の文字は追加しない」と書き、元画像の文字を守る。
+- **データは正確に**: 図表は値・単位・関係・期間を書く。例示データは例示と明記し、架空の数字を実データとして出さない。
+- **格子は行×列で**: "2 rows and 3 columns" / "3×3 (rows × columns)"。不規則な配置はそのまま書く("3 panels on top
+  and 2 below")。1 マスは "row 2, column 1"。
 
 **参照画像で編集(edit)**
-- 参照画像はアップロード順に `<Picture 1>`, `<Picture 2>` … と書く。
-- 本家の手本は 3 部構成: `<Picture 1>` の要素を `<Subject N>` として定義 →「保持するもの」と「変えるもの」を明示 →
-  完成後の画像全体を記述。保持する要素は見えている事実に忠実に、変更部分だけ新しい見た目を具体的に。
-- 例(本家 `examples/prompt.edit.txt` の冒頭):
-  > The dark, warmly lit podcast studio photograph of two hosts behind a wooden desk in <Picture 1> is <Subject 1>.
-  > <Subject 1> is mostly preserved: the large "EP. 47" title in the top right corner, … Take the over-ear headphones
-  > off the man on the left … and have both hosts fist-bump directly above the "MONEY TALKS" desk sign …
+- 参照はアップロード順に `<Picture 1>`, `<Picture 2>` …。
+- 1 段落で **定義 → 完成形と各参照の役割 → 変わる部分の詳細** の順。命令ではなく完成した状態を語る
+  ("The former location is filled by continuous tabletop")。
+- 定義: `The red cup on the left in <Picture 1> is <Subject 1>.` のように、独立した扱いが要る範囲ごとに `<Subject N>`。
+  色だけ借りる参照は「色という性質」として定義し、形や素材は借りないと書く。
+- 役割: 完成形を `The target image …` で始め、各 Subject に 1 つずつ関係を書く。
+  完全保持は定型文 `<Subject N> is fully preserved.`、部分保持は「何が残り何が変わるか」、
+  性質の転写は `<Subject 2> supplies the exact body color transferred to <Subject 1>.`、
+  弱い参照は「借りる性質と変えてよい範囲」。移動・回転・複製・照明変更も「変更」に数える。
+- 変更の詳細: 消すなら跡地に何があるか。移動と複製は区別する。文字を変えるなら行全体の完成した文言を書く。
+  保持したものの見た目を書き直さない。
+- 複数回の編集は 1 回 1 目標。「さっきのやつ」ではなく、今回使う画像・変えるもの・残すものを毎回書く。
+- 本家の例(局所的な色変更):
+  > The red cup on the left in <Picture 1> is <Subject 1>. The lemon on the right in <Picture 1> is <Subject 2>.
+  > The target image shows <Subject 1> with a blue finish. <Subject 1> is partially preserved; its shape, material,
+  > position, and scale remain while its surface color changes. <Subject 2> is fully preserved. …
+
+**最終チェック(本家 skill の Final check)**
+文字は全部引用して綴りどおりか / 数・位置・左右・前後・接触が要求どおりか / 値・単位・ラベルが揃っているか /
+各参照に役割があり保持するものを名指ししたか / アスペクト比が構図に合うか / 「見える細部」で言い換えられる曖昧な
+品質語が残っていないか。
+
+アスペクト比は 1:3〜3:1。本家 API の推奨サイズ(約 16MP)に対し本サーバは 4MP(2048² 相当)を既定にしています。
 
 **プロンプト拡張(本サーバの機能)**
-UI の「拡張」ボタン / `POST /api/prompts/enhance` は、PE 同梱の公式ルールをそのまま system prompt として
-OpenAI 互換の LLM(例: llama.cpp server の gemma 系)に送り、短い日本語の指示を公式ルール準拠の英語プロンプトと
-推奨アスペクト比に変換します。PE モデル本体(FP4 約 19GB)を載せずに済む代わりに、精度は本家 PE に劣る可能性があります。
-編集モードでは参照画像も LLM に渡す(マルチモーダル対応の LLM が必要)。設定は `H3IMG_LLM_BASE_URL` /
-`H3IMG_LLM_MODEL` / `H3IMG_LLM_API_KEY`(環境変数または `.env`)。公式ルールの文書は初回に PE リポジトリから
-`models/prompts/` へ取得します。
+UI の「拡張」ボタン / `POST /api/prompts/enhance` は、プロンプト拡張モデル
+[MiniMaxAI/MiniMax-H3-Image-PE](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image-PE) 同梱の公式ルール
+(`prompt/t2i/task_prompt.txt` / `prompt/edit/task_prompt.txt`、公式 API の拡張ステップで使われているもの)を
+system prompt とし、さらに上記 skill のガイド本文(`references/t2i-en.txt` / `edit-en.txt`、
+`H3IMG_ENHANCE_SKILL_GUIDE=0` で外せる)を補足として足して、OpenAI 互換の LLM(例: llama.cpp server の gemma 系)に
+送ります。短い日本語の指示が公式ルール準拠の英語プロンプトと推奨アスペクト比になります。PE モデル本体
+(FP4 約 19GB)を載せずに済む代わりに、精度は本家 PE に劣る可能性があります。編集モードでは参照画像も LLM に渡す
+(マルチモーダル対応の LLM が必要)。設定は `H3IMG_LLM_BASE_URL` / `H3IMG_LLM_MODEL` / `H3IMG_LLM_API_KEY`
+(環境変数または `.env`)。ルール文書は初回に PE リポジトリと GitHub から `models/prompts/` へ取得します。
 
 ## 環境変数
 
@@ -266,6 +293,7 @@ OpenAI 互換の LLM(例: llama.cpp server の gemma 系)に送り、短い日�
 | `H3IMG_MAX_QUEUE` / `H3IMG_MAX_UPLOAD_MB` | 4 / 200 | キュー長 / アップロード上限 |
 | `H3IMG_LLM_BASE_URL` / `H3IMG_LLM_MODEL` / `H3IMG_LLM_API_KEY` | (未設定=拡張無効) | プロンプト拡張に使う OpenAI 互換 LLM(`.env` にも書ける) |
 | `H3IMG_LLM_TIMEOUT_S` | 180 | LLM のタイムアウト |
+| `H3IMG_ENHANCE_SKILL_GUIDE` | 1 | 拡張時に本家 prompt-writing skill のガイド本文も system に足す |
 
 ## 低 VRAM 化・高速化の方法
 
