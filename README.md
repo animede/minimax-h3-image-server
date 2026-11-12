@@ -3,8 +3,8 @@
 [MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)(33B、静止画生成 +
 最大 16 枚参照の編集)を **約 21GB の VRAM で、1024² を 1.8 秒・2048² を 4.1 秒**で動かす
 単独の画像サーバ + ブラウザ UI です。**W4A8 量子化 + text_encoder の層ストリーミングで 16GB 1 枚でも動き、さらに transformer の
-ブロックストリーミングで 8GB 級でも動きます**(VRAM 実使用 4.2GB・ホスト RAM 約 29GB、1024² 1.8 秒・2048² 3.5 秒・
-2048² 級の編集 6.3 秒。出力は常駐時とピクセル一致)。diffusers(main)ベース、コードは MIT ライセンス。
+ブロックストリーミングで 8GB 級でも動きます**(VRAM を 1GB 空けたまま、1024² 1.7〜2.6 秒・2048² 3.4〜4.2 秒・
+2048² 級の編集 6.2〜7.0 秒。ホスト RAM 32GB の PC でも動く設定あり。出力は常駐時とピクセル一致)。diffusers(main)ベース、コードは MIT ライセンス。
 
 - 本家の bf16 は transformer 66GB + text_encoder 66.7GB で 80GB GPU にも同時に載りませんが、
   本サーバは **AdaLN 射影の事前計算テーブル(bit 一致・近似なし)+ int8 重み量子化 + nf4 text_encoder**で
@@ -179,6 +179,8 @@ H3IMG_VRAM_FALLBACK=0 ./run.sh
 | `H3IMG_TE_STREAM` | `auto` / `0` / `1` | text_encoder の層ストリーミング(常駐 17GB → 0.3GB) |
 | `H3IMG_TRANSFORMER_STREAM` | `auto` / `0` / `1` | transformer のブロックストリーミング(常駐 11GB → 1GB) |
 | `H3IMG_VRAM_FALLBACK` | `1` / `0` | 生成中の OOM で一段下のプロファイルへ自動で下げる |
+| `H3IMG_VRAM_RESERVE_GB` | 数値(既定 1.0) | 必ず空けておく VRAM(画面表示などの分) |
+| `H3IMG_TE_HOST` | `auto` / `pinned` / `mmap` | text_encoder の原本の置き場所(mmap は RAM 32GB の PC 向け) |
 
 | プロファイル | 量子化 | TE | transformer | 要る空き VRAM | 速度(1024² / 2048²) |
 |---|---|---|---|---|---|
@@ -285,6 +287,8 @@ system prompt とし、さらに上記 skill のガイド本文(`references/t2i-
 | `H3IMG_GPU` / `H3IMG_TE_GPU` | 0 /(2 枚あれば 1) | transformer / text_encoder を置く GPU 番号(`H3IMG_DEVICE=cuda:N` / `H3IMG_TE_DEVICE` でも可) |
 | `H3IMG_VRAM_GB` | auto | VRAM 予算(GB)。auto = GPU の総容量。実際の空きと小さい方で 48gb / 32gb / 16gb / 8gb プロファイルを選ぶ |
 | `H3IMG_VRAM_FALLBACK` | 1 | 生成中の CUDA OOM で一段下のプロファイルへ自動で下げてやり直す |
+| `H3IMG_VRAM_RESERVE_GB` | 1.0 | 予算から差し引いて必ず空けておく VRAM(画面表示・他のアプリ用) |
+| `H3IMG_TE_HOST` | auto | text_encoder の原本: `pinned`(速い、RAM 約 13GB)/ `mmap`(ページキャッシュ、RAM の少ない PC 向け)。auto は搭載 48GB 以上で pinned |
 | `H3IMG_GENERATION_AREA` | requested | 既定キャンバス(`native` = 最低 4MP) |
 | `H3IMG_PRELOAD` | 0 | 1 で起動時にロード |
 | `H3IMG_MODELS_DIR` | `./models` | te / lora / cache の置き場 |
@@ -456,6 +460,30 @@ GPU から外したものはホスト RAM に置きます。最初の実装は 8
 
 また、ロード時に PyTorch のアロケータが予約できる量を「VRAM 予算 − 1GB」に制限しています
 (`torch.cuda.set_per_process_memory_fraction`)。ストリーミングで解放が遅れても、予算を超えて VRAM を抱え込みません。
+
+### VRAM の予備と、RAM の少ない PC 向けの設定
+
+**VRAM の予備(`H3IMG_VRAM_RESERVE_GB`、既定 1GB)**: 予算を「空き − 予備」で計算し、画面表示や他のアプリのために
+必ず 1GB を空けておきます。予算に余りがあれば、ストリーミング構成でも VAE(1.4GB)と text_encoder の埋め込み表
+(1.45GB)を GPU に置きます(往復とホスト RAM が減る)。PyTorch のアロケータが予約できる量も予算までに制限します。
+
+**text_encoder の原本の置き場所(`H3IMG_TE_HOST`)**:
+
+- `pinned`: ピン留めしたホスト RAM(約 13GB を常に使う)。速い。
+- `mmap`: safetensors ファイルのページキャッシュから直接流す。ページキャッシュは OS がいつでも回収できる
+  メモリなので、**必須のホスト RAM が約 13GB 減ります**。代わりにピン留めしない分、生成が 0.7〜0.9 秒遅くなります。
+- `auto`(既定): 搭載 RAM が 48GB 以上なら `pinned`、未満なら `mmap`。
+
+8GB / 16GB のカードを模擬した実測(GPU の空きを 7.3GB / 15.5GB に制限、予備 1GB。出力はすべて同一):
+
+| カード | TE 原本 | プロセスの VRAM | 実行中の GPU の空き(最小) | 必須のホスト RAM | 1024² | 2048² | 編集 1664×2496 |
+|---|---|---|---|---|---|---|---|
+| 8GB | mmap | 5.9GB(VAE も GPU) | 1.5GB | **12.4GB**(+ ページキャッシュ 14GB) | 2.6s | 4.2s | 7.0s |
+| 8GB | pinned | 5.9GB | 1.5GB | 27.2GB | 1.7s | 3.4s | 6.2s |
+| 16GB | mmap | 14.1GB | 1.7GB | **3.5GB**(+ ページキャッシュ 14GB) | 2.2s | 4.4s | 7.2s |
+| 16GB | pinned | 14.1GB | 1.7GB | 18.3GB | 1.3s | 3.5s | 6.2s |
+
+**RAM 32GB の PC では `mmap`(既定で自動選択)**、48GB 以上なら `pinned` で速くなります。
 
 ### 試して採らなかったこと
 
