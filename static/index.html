@@ -5,7 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MiniMax-H3-Image</title>
 <style>
-  :root { --bg:#14161a; --panel:#1d2026; --line:#2c3038; --fg:#e6e6e6; --muted:#9aa0a8; --acc:#4f8cff; --err:#ff6b6b; }
+  :root { color-scheme:dark; --bg:#14161a; --panel:#1d2026; --line:#2c3038; --fg:#e6e6e6; --muted:#9aa0a8; --acc:#4f8cff; --err:#ff6b6b;
+          --input:#0f1115; --link:#9ec1ff; --danger-bg:#3a1f22; --danger-line:#5a2b31; --danger-fg:#ffb3b3; --tag-bg:rgba(0,0,0,.6); --tag-fg:#fff; }
+  /* OS が明るい配色ならライトテーマ */
+  @media (prefers-color-scheme: light) {
+    :root { color-scheme:light; --bg:#f4f5f7; --panel:#ffffff; --line:#d9dce1; --fg:#1d2026; --muted:#5f6670; --acc:#2f6fe0; --err:#c62828;
+            --input:#ffffff; --link:#1f5fc9; --danger-bg:#fdecec; --danger-line:#f1b8b8; --danger-fg:#b42323; --tag-bg:rgba(255,255,255,.85); --tag-fg:#1d2026; }
+  }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui, "Noto Sans JP", sans-serif; }
   .wrap { display:grid; grid-template-columns: 400px 1fr; gap:16px; padding:16px; min-height:100vh; }
@@ -14,7 +20,7 @@
   h1 { font-size:16px; margin:0 0 10px; }
   h2 { font-size:14px; margin:14px 0 6px; color:var(--muted); }
   label { display:block; margin:8px 0 4px; color:var(--muted); font-size:12px; }
-  input, select, textarea, button { width:100%; background:#0f1115; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 9px; font:inherit; }
+  input, select, textarea, button { width:100%; background:var(--input); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 9px; font:inherit; }
   textarea { min-height:120px; resize:vertical; }
   .row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
   .row3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; }
@@ -23,21 +29,21 @@
   button.small { width:auto; padding:4px 10px; cursor:pointer; }
   .muted { color:var(--muted); font-size:12px; }
   .err { color:var(--err); white-space:pre-wrap; }
-  .bar { height:8px; background:#0f1115; border-radius:4px; overflow:hidden; margin-top:8px; }
+  .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin-top:8px; }
   .bar > div { height:100%; background:var(--acc); width:0; transition:width .3s; }
   .result img { max-width:100%; border-radius:8px; border:1px solid var(--line); }
   .refs { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
   .refs .ref { position:relative; width:88px; height:88px; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
   .refs .ref img { width:100%; height:100%; object-fit:cover; }
-  .refs .ref span { position:absolute; left:4px; top:2px; font-size:11px; background:rgba(0,0,0,.6); padding:0 4px; border-radius:3px; }
+  .refs .ref span { position:absolute; left:4px; top:2px; font-size:11px; background:var(--tag-bg); color:var(--tag-fg); padding:0 4px; border-radius:3px; }
   .refs .ref button { position:absolute; right:2px; top:2px; width:auto; padding:0 5px; font-size:11px; }
   table { width:100%; border-collapse:collapse; font-size:12px; }
   td, th { border-bottom:1px solid var(--line); padding:5px 6px; text-align:left; }
   .thumb { width:64px; height:64px; object-fit:cover; border-radius:4px; }
   .status { font-size:12px; color:var(--muted); margin-top:8px; }
   .actions { display:flex; gap:10px; align-items:center; margin-top:8px; }
-  .small-link { color:#9ec1ff; font-size:12px; }
-  button.danger { background:#3a1f22; border-color:#5a2b31; color:#ffb3b3; }
+  .small-link { color:var(--link); font-size:12px; }
+  button.danger { background:var(--danger-bg); border-color:var(--danger-line); color:var(--danger-fg); }
   td.ops { white-space:nowrap; } td.ops a { margin-right:8px; }
 </style>
 </head>
