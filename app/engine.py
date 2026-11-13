@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 
 from . import pruned_image
-from .config import STEP_PRESETS, Settings
+from .config import STEP_PRESETS, TEXT_ENCODER_LAYER, Settings
 
 logger = logging.getLogger("h3image.engine")
 
@@ -48,6 +48,12 @@ class _CpuEmbedding(torch.nn.Module):
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         return self.inner(ids.to("cpu")).to(self.device, non_blocking=True)
+
+
+class _HiddenOnly:
+    """text_encoder.model の返り値の代わり(encoder step は .hidden_states[50] しか読まない)。"""
+    def __init__(self, hidden_states):
+        self.hidden_states = hidden_states
 
 
 class _UnusedHead(torch.nn.Module):
@@ -172,6 +178,7 @@ class Engine:
         # ストリーミング時は最初から CPU へ読む(GPU へ全部載せてから退避すると、ロードの時点で 16GB を超える)
         te = AutoModelForImageTextToText.from_pretrained(str(self.s.te_dir), dtype=torch.bfloat16,
                                                          device_map="cpu" if stream else str(self.te_device))
+        self._keep_only_layer_output(te)
         if self.te_device != self.device:
             self._route_text_encoder(te)
         elif stream:
@@ -291,6 +298,40 @@ class Engine:
                     "pinned=%s)", self.te_host, len(lm.layers), time.time() - t0,
                     torch.cuda.memory_allocated(dev) / 2**30, self.embed_on_gpu, pruned_image.pinned_gb())
 
+    class _Captured(Exception):
+        def __init__(self, hidden):
+            self.hidden = hidden
+
+    def _keep_only_layer_output(self, te) -> None:
+        """te.model を包み、`hidden_states[50]`(= 50 番目の decoder 層の出力)だけを返す。
+
+        diffusers の encoder step は `output_hidden_states=True` で呼ぶので、そのままだと 52 本の hidden state
+        (51 層 × トークン数 × 5120 × 2 バイト)が全部 GPU に残る。テキストだけなら数十 MB だが、参照画像は
+        1024² で約 1k トークン、2048² で約 4k トークンになり、参照 3 枚の編集で 1.6GB、2048² の参照 2 枚で 4GB を
+        超えて 8gb 構成では OOM した(実測)。50 番目の層の出力を hook で取り、そこで forward を打ち切る
+        (51 番目の層も読まなくて済む)。返り値は `.hidden_states[50]` だけが入った tuple。
+        """
+        inner = te.model
+        layer = inner.language_model.layers[TEXT_ENCODER_LAYER - 1]
+        orig = inner.forward
+        captured = self._Captured
+
+        def hook(mod, args, out):
+            raise captured(out[0] if isinstance(out, tuple) else out)
+
+        layer.register_forward_hook(hook)
+        n = TEXT_ENCODER_LAYER
+
+        def forward(*args, **kwargs):
+            kwargs["output_hidden_states"] = False
+            try:
+                orig(*args, **kwargs)
+            except captured as c:
+                return _HiddenOnly(tuple([None] * n + [c.hidden]))
+            raise RuntimeError(f"text_encoder の {n} 番目の層が呼ばれませんでした(層数の設定を確認)")
+
+        inner.forward = forward
+
     def _route_text_encoder(self, te) -> None:
         """te.model.forward を包み、入力を TE 側 GPU へ、hidden_states[50] だけをホスト経由で返す。"""
         te_dev = self.te_device
@@ -307,7 +348,7 @@ class Engine:
             kwargs = {k: via_host(v) for k, v in kwargs.items()}
             out = orig(*args, **kwargs)
             hs = out.hidden_states
-            out.hidden_states = tuple(h.to("cpu") if i == 50 else None for i, h in enumerate(hs))
+            out.hidden_states = tuple(h.to("cpu") if h is not None else None for h in hs)
             return out
 
         inner.forward = forward

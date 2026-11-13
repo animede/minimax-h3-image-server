@@ -586,6 +586,12 @@ NVMe は Gen4 で連続読み 2.3GB/s、予備 1GB、出力は pinned 構成と�
   `read`)は 1.6GB/s 止まりでしたが、層のテンソル全部を 32MB ずつ 8 スレッドで同時に読むと同じ NVMe で 4GB/s 出ます
   (TE 13GB の通過が 8.4 秒 → 4.0 秒)。読む量は `mmap` より少し多い(末尾ブロックの分)のに、合計では速くなります。
   SATA SSD では読み込み量 ÷ 0.5GB/s で +30 秒前後になります。
+- **参照画像が 2 枚以上の編集は、text_encoder の hidden state を 1 本だけ残す**ようにして収まるようにしました。
+  diffusers の encoder step は `output_hidden_states=True` で呼ぶため 52 本の hidden state(51 層 × トークン数 × 5120 × 2B)
+  が GPU に残り、参照 3 枚(1024²)で 1.6GB、2048² の参照 2 枚で 4GB を超えて 8gb 構成では OOM していました。使うのは
+  `hidden_states[50]` だけなので、50 番目の層の出力を hook で取ってそこで forward を打ち切ります(出力はピクセル一致)。
+  Ada・空き 6GB・RAM 12GB 上限の実測: 参照 1 / 2 / 3 枚(1024²)で 14.4 / 19.2 / 26.4s、peak 2.9GB、参照 2 / 3 枚で
+  2048² 出力 29.3 / 41.7s、peak 3.3GB。
 - `file` の受け皿(staging)は `pin_memory()`(cudaHostAlloc)ではなく、普通のメモリを `cudaHostRegister` でピン留め
   します。前者は cgroup に "file" として計上され、ページキャッシュの予算計算(匿名メモリを差し引く)から漏れて
   transformer を押し出していました(実測で読み直しが 28GB に増えた)。

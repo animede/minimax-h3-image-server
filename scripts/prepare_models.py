@@ -33,13 +33,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.config import LORA_FILENAME, settings  # noqa: E402
+from app.config import LORA_FILENAME, TEXT_ENCODER_LAYER, settings  # noqa: E402
 
 IMAGE_REPO = settings.model_id
 TE_REPO = "MiniMaxAI/MiniMax-H3"
 LORA_REPO = "akhaliq/minimax-h3-image-pdmd-2step"
 LORA_SRC_FILE = "lora_model_0.safetensors"
-TEXT_ENCODER_LAYER = 50  # hidden_states[50] を読む → 51 層あればよい
 
 
 import logging  # noqa: E402

@@ -624,6 +624,12 @@ pinned configuration:
   `read`) topped out at 1.6GB/s, whereas reading all tensors of a layer as 32MB chunks on 8 threads at once reaches
   4GB/s on the same NVMe (the 13GB text-encoder pass went from 8.4 s to 4.0 s). It reads slightly more than `mmap`
   (the trailing blocks) yet finishes sooner. On a SATA SSD expect about +30 s (bytes read ÷ 0.5GB/s).
+- **Edits with two or more reference images fit by keeping only one text-encoder hidden state.** The diffusers
+  encoder step calls the text encoder with `output_hidden_states=True`, which keeps all 52 hidden states on the GPU
+  (51 layers × tokens × 5120 × 2 B): 1.6GB with 3 references at 1024², over 4GB with 2 references at 2048², an OOM on
+  the 8gb profile. Only `hidden_states[50]` is used, so a hook captures the 50th layer's output and stops the forward
+  there (outputs are pixel-identical). Measured on the Ada card with 6GB free and a 12GB RAM cap: 1 / 2 / 3 references
+  at 1024² in 14.4 / 19.2 / 26.4 s (peak 2.9GB), 2 / 3 references with 2048² output in 29.3 / 41.7 s (peak 3.3GB).
 - The `file` staging buffers are ordinary memory pinned with `cudaHostRegister`, not `pin_memory()` (cudaHostAlloc):
   the latter is charged to the cgroup as "file" memory, which escaped the page-cache budget (it subtracts anonymous
   memory) and pushed the transformer out of the cache (re-reads rose to 28GB in measurements).

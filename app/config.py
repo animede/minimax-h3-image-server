@@ -24,6 +24,7 @@ STEP_PRESETS = {
     2: ([1.0, 0.9230769230769231, 0.0], "_pdmd2", True),
 }
 
+TEXT_ENCODER_LAYER = 50   # MiniMax-H3 は Qwen3-VL の hidden_states[50] を読む(51 層あればよい)
 LORA_FILENAME = "minimax_h3_image_pdmd_2step_lora.safetensors"
 
 
