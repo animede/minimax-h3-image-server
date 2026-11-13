@@ -322,10 +322,19 @@ def _make_readahead(masters: list):
         if 0 <= i < len(ranges):
             for start, length in ranges[i]:
                 libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(length), 3)   # MADV_WILLNEED
+
+    def drop(i: int) -> None:
+        """使い終わった層のページをページキャッシュから追い出す(MADV_PAGEOUT、Linux 5.4+)。
+        TE の層は 1 回しか読まないので、残しておくと transformer のページを押し出すだけ。"""
+        if 0 <= i < len(ranges):
+            for start, length in ranges[i]:
+                libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(length), 21)  # MADV_PAGEOUT
+    readahead.drop = drop
     return readahead
 
 
-def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = True, pin: bool = True) -> None:
+def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = True, pin: bool = True,
+                  drop_after_use: bool = False) -> None:
     """layers(順に呼ばれる層の列)をピン留めした原本に置き、forward hook で 1 つずつ GPU へ流す。
     層 i の計算中に i+1 を別 stream で先読みする。
 
@@ -340,6 +349,7 @@ def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = Tru
         masters.append(pin_module(layer, owner) if pin else [(sl, _get(sl)) for sl in _slots(layer)])
     n = len(masters)
     readahead = (lambda i: None) if pin else _make_readahead(masters)
+    drop_after_use = drop_after_use and not pin
     if not prefetch:
         # 先読みなし: 計算と同じ stream でコピーする。解放はストリーム順序で守られるので record_stream が要らず、
         # アロケータの予約が膨らまない(1 回しか通らない TE 向け)。mmap のときはディスクの先読みだけ出す。
@@ -352,6 +362,8 @@ def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = Tru
 
         def post_sync(mod, args, out, _m=None):
             to_host(_m)
+            if drop_after_use:
+                readahead.drop(index[id(_m)])
 
         for layer, m in zip(layers, masters):
             layer.register_forward_pre_hook(functools.partial(pre_sync, _m=m), with_kwargs=True)

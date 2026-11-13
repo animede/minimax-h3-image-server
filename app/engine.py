@@ -272,7 +272,10 @@ class Engine:
         # record_stream で解放が遅れ、アロケータの予約が膨らむ(8gb 構成で 4.2GB → 6.6GB)。
         # te_host == "mmap": 原本は safetensors の mmap(ページキャッシュ)のまま。ピン留めしないので必須の RAM が
         # 約 13GB 減る(OS が回収できるメモリになる)。"pinned": cudaHostRegister でピン留めした原本(速いが常に使う)。
-        pruned_image.stream_layers(lm.layers, dev, owner="te", prefetch=False, pin=self.te_host == "pinned")
+        # mmap のときは使い終わった層のページをその場で捨てる(1 回しか読まないので、残すと transformer の
+        # ページキャッシュを押し出すだけ。RAM の少ない PC で transformer を読み直さずに済むようにする)
+        pruned_image.stream_layers(lm.layers, dev, owner="te", prefetch=False, pin=self.te_host == "pinned",
+                                   drop_after_use=self.te_host == "mmap")
         te.lm_head = _UnusedHead()
         emb = lm.embed_tokens
         if self.embed_on_gpu:
