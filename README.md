@@ -117,6 +117,7 @@ int8wo と同程度です。品質は同一 seed で int8wo と並べて目視�
 git clone <this repo> minimax-h3-image-server && cd minimax-h3-image-server
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
+# uv を使わない場合: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # モデル類の準備(初回のみ。本家モデル 64GB + LoRA のダウンロードと text_encoder の量子化。GPU が必要)
 .venv/bin/python scripts/prepare_models.py --delete-te-source
@@ -140,12 +141,26 @@ uv pip install --python .venv/bin/python -r requirements.txt
 `triton-windows`)。コード側の OS 依存は RAM の取得と `madvise` だけで、Windows では前者を Win32 API で代替し、後者は
 行いません。**まだ実機で確認していません**(確認でき次第この注記を外します)。
 
+uv を使う場合(uv は `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"` で入ります。
+インストール後は PowerShell を開き直してください):
+
 ```powershell
 git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
 uv venv --python 3.12 .venv
 uv pip install --python .venv\Scripts\python.exe -r requirements-windows.txt
 .venv\Scripts\python.exe scripts\prepare_models.py --delete-te-source     # モデルの準備(GPU が必要)
 .\run.ps1                                                                 # http://127.0.0.1:8633/
+```
+
+uv を使わない場合(Python 3.12 が入っていれば標準の venv + pip で同じことができます):
+
+```powershell
+git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
+py -3.12 -m venv .venv                      # py が無ければ python -m venv .venv(3.12 系であること)
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install -r requirements-windows.txt
+.venv\Scripts\python.exe scripts\prepare_models.py --delete-te-source
+.\run.ps1
 ```
 
 - CUDA 13 系に対応した NVIDIA ドライバが必要です。

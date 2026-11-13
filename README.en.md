@@ -126,6 +126,7 @@ see method 6 [below](#how-the-vram-was-reduced-and-the-speed-increased)).
 git clone <this repo> minimax-h3-image-server && cd minimax-h3-image-server
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
+# without uv: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # Prepare the models (first time only: downloads the 64GB model + LoRA and quantizes the text encoder; needs a GPU)
 .venv/bin/python scripts/prepare_models.py --delete-te-source
@@ -150,12 +151,26 @@ Windows wheels exist for all dependencies (torch 2.11+cu130, comfy-kitchen, bits
 for Triton). The only OS-specific code is reading RAM figures and `madvise`; on Windows the former uses Win32 APIs and
 the latter is skipped. **Not yet verified on a real Windows machine** (this note will be removed once it is).
 
+With uv (install it with `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"` and
+reopen PowerShell afterwards):
+
 ```powershell
 git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
 uv venv --python 3.12 .venv
 uv pip install --python .venv\Scripts\python.exe -r requirements-windows.txt
 .venv\Scripts\python.exe scripts\prepare_models.py --delete-te-source     # prepare the models (needs a GPU)
 .\run.ps1                                                                 # http://127.0.0.1:8633/
+```
+
+Without uv (the standard venv + pip work the same, as long as Python 3.12 is installed):
+
+```powershell
+git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
+py -3.12 -m venv .venv                      # or python -m venv .venv if `py` is unavailable (must be 3.12)
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install -r requirements-windows.txt
+.venv\Scripts\python.exe scripts\prepare_models.py --delete-te-source
+.\run.ps1
 ```
 
 - An NVIDIA driver supporting CUDA 13 is required.
