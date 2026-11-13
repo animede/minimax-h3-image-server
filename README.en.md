@@ -111,8 +111,9 @@ see method 6 [below](#how-the-vram-was-reduced-and-the-speed-increased)).
 - Quality: 3 steps look nearly identical to 6 steps at 100% zoom. **2 steps show a fine woven pattern**, so use them
   for previews. However, **at 1024² with a short prompt such as "mountain and river", 3 steps can also show a grid-like
   grain on mountainsides and water** (independent of the quantization/streaming configuration: the 8gb and 32gb
-  profiles are pixel-identical and int8wo on 48gb shows the same; 6 steps removes it). For landscapes with large smooth
-  areas, use 6 steps or a detailed prompt written the official way.
+  profiles are pixel-identical and int8wo on 48gb shows the same; 6 steps removes it, also on a Windows RTX 3050, where
+  1024² goes from 23 s to 42.5 s). For landscapes with large smooth areas, use 6 steps or a detailed prompt written the
+  official way.
 - With `generation_area: "native"` (generate on the officially recommended minimum 4MP canvas, then downscale), 1024²
   takes as long as 2048².
 - For comparison: loading the same weights plainly as bnb int8 (`load_in_8bit` in `from_pretrained`) gives
@@ -613,7 +614,7 @@ pinned configuration:
 | **file × file, 12GB cap (current default; 5 trailing blocks read from the file)** | **10.5 s** | **14.4 s** | — | 16GB | 2.3GB |
 | same, 11GB cap (10 trailing blocks) | 10.6 s | 14.5 s | — | 19GB | 2.3GB |
 | same, 10GB cap (15 trailing blocks) | 11.1 s | 14.5 s | — | 22GB | 2.3GB |
-| **Windows, real machine: RTX 3050 6GB, 16GB RAM, Gen3 DRAM-less NVMe (1.3GB/s), file × file** | **~23 s** | — | — | 16GB | 2.3GB |
+| **Windows, real machine: RTX 3050 6GB, 16GB RAM, Gen3 DRAM-less NVMe (1.3GB/s), file × file** | **~23 s** (6 steps: 42.5 s) | — | — | 16GB | 2.3GB |
 | mmap × mmap, 12GB cap (previous Linux-only default) | 12.5–12.8 s | 16.6 s | 28.9 s | 13–14GB | 1.8GB |
 | same, 11GB cap (6 trailing blocks dropped) | 13.5 s | 17.3 s | — | 16.7GB | 1.8GB |
 | same, 10GB cap (11 trailing blocks dropped) | 13.9 s | 17.6 s | — | 19.7GB | 1.8GB |
