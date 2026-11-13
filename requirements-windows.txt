@@ -1,4 +1,5 @@
 # Windows 用(requirements.txt との違い: triton は triton-windows を使う。他は同じ版の win_amd64 wheel が公開されている)
+# Windows 11 + RTX 3050 6GB(RAM 16GB、Python 3.12、CUDA 13 系ドライバ)で導入・生成を実機確認済み
 --extra-index-url https://download.pytorch.org/whl/cu130
 torch==2.11.0
 torchvision==0.26.0
