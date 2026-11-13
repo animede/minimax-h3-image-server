@@ -363,8 +363,14 @@ class Engine:
         quant = self.profile.quant
         cache_name = {"int8wo": "int8wo_adaln_table", "ck-w4a8": "ckw4a8_adaln_table"}[quant] + tag
         stream = self._transformer_stream_enabled()
-        tr = pruned_image.load_transformer(self._resolve_repo(), self.pipe, self.device,
-                                           self.s.cache_dir / cache_name, quant=quant, lora_path=lora,
+        from .sources import ShardSource
+        repo = self._resolve_repo()
+        # キャッシュが無いときの bf16 シャードは 1 つずつ取得して消す(H3IMG_KEEP_SOURCE=1 なら消さない。
+        # 元から置いてあるファイルは消さない)
+        shards = ShardSource(self.s.model_id, "transformer_diffusers", Path(repo) / "transformer_diffusers",
+                             keep=self.s.keep_source) if not self.s.model_dir else None
+        tr = pruned_image.load_transformer(repo, self.pipe, self.device,
+                                           self.s.cache_dir / cache_name, quant=quant, lora_path=lora, shards=shards,
                                            stream_blocks=stream, pin_blocks=self.transformer_host == "pinned",
                                            drop_blocks=self.s.transformer_drop_blocks,
                                            file_blocks=self.transformer_host == "file")

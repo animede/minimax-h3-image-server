@@ -121,9 +121,11 @@ see method 6 [below](#how-the-vram-was-reduced-and-the-speed-increased)).
 
 - NVIDIA GPU (see above). Verified on sm_120 (Blackwell). torch 2.11.0+cu130 requires a CUDA 13 driver.
 - Python 3.12, [uv](https://github.com/astral-sh/uv) (pip also works).
-- Disk: the original model 64GB (HF cache) + LoRA 1.4GB + quantized text encoder 17GB + transformer cache 19GiB
-  (int8wo) or 10.7GiB (ck-w4a8) per step count you use. **Creating the text encoder temporarily needs +66.7GB**
-  (the bf16 source; `--delete-te-source` deletes it afterwards).
+- Disk (resident): the small parts of the original model (VAE etc.) 2.5GB + LoRA 1.4GB + quantized text encoder 17GB +
+  transformer cache 19GiB (int8wo) or 10.7GiB (ck-w4a8) per step count you use = **about 32GB with ck-w4a8**.
+  The bf16 sources (text encoder 66.7GB, transformer 62GB) are **downloaded one 5GB shard at a time, quantized, and
+  deleted**, so the peak during preparation is the resident size + about 5GB (`--keep-source` keeps everything,
+  which avoids re-downloading when you later build a cache for another step count).
 - Model preparation (`prepare_models.py`) also runs with little VRAM: the text encoder is quantized to nf4 layer by
   layer (0.3GB of VRAM, 1GB of RAM) and the transformer quantization cache is built with 2GB of VRAM and 3GB of RAM
   even on the 6GB-class profile (measured under a 12GB RAM cap). **A PC with a 6GB GPU and 16GB of RAM can go from
@@ -138,7 +140,7 @@ uv pip install --python .venv/bin/python -r requirements.txt
 # without uv: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # Prepare the models (first time only: downloads the 64GB model + LoRA and quantizes the text encoder; needs a GPU, <1GB of VRAM)
-.venv/bin/python scripts/prepare_models.py --delete-te-source
+.venv/bin/python scripts/prepare_models.py
 
 # Optional: build the transformer quantization cache in advance (otherwise built on the first generation)
 .venv/bin/python scripts/prepare_models.py --skip-download --build-cache 3
@@ -171,7 +173,7 @@ reopen PowerShell afterwards):
 git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
 uv venv --python 3.12 .venv
 uv pip install --python .venv\Scripts\python.exe -r requirements-windows.txt
-.venv\Scripts\python.exe scripts\prepare_models.py --delete-te-source     # prepare the models (needs a GPU)
+.venv\Scripts\python.exe scripts\prepare_models.py     # prepare the models (needs a GPU, <1GB of VRAM)
 .\run.ps1                                                                 # http://127.0.0.1:8633/
 ```
 
@@ -182,7 +184,7 @@ git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
 py -3.12 -m venv .venv                      # or python -m venv .venv if `py` is unavailable (must be 3.12)
 .venv\Scripts\python.exe -m pip install --upgrade pip
 .venv\Scripts\python.exe -m pip install -r requirements-windows.txt
-.venv\Scripts\python.exe scripts\prepare_models.py --delete-te-source
+.venv\Scripts\python.exe scripts\prepare_models.py
 .\run.ps1
 ```
 
@@ -364,6 +366,7 @@ are fetched into `models/prompts/` from the PE repository and GitHub on first us
 | `H3IMG_TE_HOST` | auto | Text-encoder weights: `pinned` (fast, ~13GB of RAM) / `file` (each layer read straight from the file; for PCs with little RAM, any OS) / `mmap` (page cache + madvise, Linux only). auto = pinned with ≥48GB of RAM, otherwise file |
 | `H3IMG_TRANSFORMER_HOST` | auto | Transformer blocks (8gb profile): `pinned` (~10GB of RAM) / `file` or `mmap` (streamed from the quantization cache's page cache, overflow re-read from disk; for PCs with 16GB of RAM). auto follows the TE rule |
 | `H3IMG_TRANSFORMER_DROP_BLOCKS` | auto | With `file` / `mmap`, how many trailing blocks to re-read (file) or drop (mmap) after use. auto = only the overflow that does not fit in RAM; 0 = never |
+| `H3IMG_KEEP_SOURCE` | 0 | Set to 1 to keep the transformer bf16 shards downloaded one by one during the cache build (files that were already present are never deleted either way) |
 | `H3IMG_GENERATION_AREA` | requested | Default canvas (`native` = at least 4MP) |
 | `H3IMG_PRELOAD` | 0 | 1 = load at startup |
 | `H3IMG_MODELS_DIR` | `./models` | Location of te / lora / cache |

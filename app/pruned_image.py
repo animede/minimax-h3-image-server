@@ -613,8 +613,11 @@ def load_lora_pairs(lora_path: str) -> tuple[dict[str, tuple[torch.Tensor, torch
 
 def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: bool = True,
                 quant: str = "int8wo", lora_path: str | None = None, stream_blocks: bool = False,
-                pin_blocks: bool = True, drop_blocks: str = "auto", spill_dir: Path | None = None):
+                pin_blocks: bool = True, drop_blocks: str = "auto", spill_dir: Path | None = None, shards=None):
     """bf16 シャードから量子化済み transformer を組み立てる(1 テンソルずつ GPU へ)。
+
+    shards(ShardSource): bf16 シャードを 1 つずつダウンロードし、読み終わったら消す(ディスクのピークを抑える)。
+    None なら repo/transformer_diffusers に全シャードがある前提。
 
     spill_dir(stream_blocks のとき): 量子化の済んだブロックをその場で safetensors に書き出し、以後は
     そのファイルの mmap を参照する(RAM に 11GB 溜めない。RAM 16GB の PC でもキャッシュを作れる)。
@@ -643,28 +646,20 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
     n_merged = 0
     t0 = time.time()
 
-    # Pass 1: AdaLN 射影でも量子化対象でもない小さいテンソル(time_embedder 等)を先に実体化し、
-    # 時刻集合の temb を得る。
-    for shard, names in by_shard.items():
-        with safe_open(str(sub / shard), framework="pt", device="cpu") as f:
-            for name in names:
-                if "adaln_proj" in name or _is_quant_target(name):
-                    continue
-                _assign(tr, name, device, f.get_tensor(name))
-    keys = keys.to(device)
-    with torch.no_grad():
-        temb = tr.time_embedder(tr.time_proj(keys).to(tr.time_embedder.linear_1.weight.dtype))  # float32
-    act = F.silu(temb).to(torch.bfloat16)
-    logger.info("pass1 (small tensors + temb for %d timesteps): %.1fs", len(keys), time.time() - t0)
-
-    # Pass 2: ブロックの重み。AdaLN はテーブル化、Linear は int8wo 化。
+    # シャードを順に 1 回だけ読む(shards があれば 1 つずつダウンロードして、読み終わったら消す)。
+    # 各シャードでは、まず AdaLN でも量子化対象でもない小さいテンソル(time_embedder 等)を実体化し、
+    # time_embedder が揃った時点で時刻集合の temb を計算する(AdaLN テーブルの入力。time_embedder は
+    # 先頭シャードにあるので、AdaLN を処理する前に必ず揃う)。
     pending_adaln: dict[int, dict[str, torch.Tensor]] = {}
     n_quant = 0
     modules = dict(tr.named_modules())
     verified = False
-    remaining: dict[int, int] = {}      # ブロック番号 → まだ処理していない(AdaLN / 量子化対象)テンソルの数
+    temb = act = None
+    temb_names = {n for n in index if n.startswith(("time_embedder.", "time_proj."))}
+    seen_small: set[str] = set()
+    remaining: dict[int, int] = {}      # ブロック番号 → まだ実体化していないテンソルの数(norm 等の小さいものも含む)
     for name in index:
-        if name.startswith("transformer_blocks.") and ("adaln_proj" in name or _is_quant_target(name)):
+        if name.startswith("transformer_blocks."):
             bi = int(name.split(".")[1])
             remaining[bi] = remaining.get(bi, 0) + 1
     if spill_dir is not None and stream_blocks:
@@ -678,10 +673,24 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
         if remaining[bi] == 0 and spill_dir is not None and stream_blocks:
             _spill_block(tr.transformer_blocks[bi], spill_dir / f"block-{bi:02d}.safetensors")
 
-    for shard, names in by_shard.items():
-        with safe_open(str(sub / shard), framework="pt", device="cpu") as f:
+    for shard in sorted(by_shard):
+        names = by_shard[shard]
+        path = shards.fetch(shard) if shards is not None else sub / shard
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            for name in names:
+                if "adaln_proj" not in name and not _is_quant_target(name):
+                    _assign(tr, name, device, f.get_tensor(name))
+                    seen_small.add(name)
+                    block_done(name)
+            if temb is None and temb_names <= seen_small:
+                keys = keys.to(device)
+                with torch.no_grad():
+                    temb = tr.time_embedder(tr.time_proj(keys).to(tr.time_embedder.linear_1.weight.dtype))  # float32
+                act = F.silu(temb).to(torch.bfloat16)
+                logger.info("temb for %d timesteps ready (shard %s): %.1fs", len(keys), shard, time.time() - t0)
             for name in names:
                 if "adaln_proj" in name:
+                    assert act is not None, "time_embedder より前に AdaLN のシャードが来ました(シャード順が想定外)"
                     bi = int(name.split(".")[1])
                     slot = pending_adaln.setdefault(bi, {})
                     slot[name.rsplit(".", 1)[-1]] = f.get_tensor(name).to(device)
@@ -722,8 +731,9 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
                         quantize_(modules[mod_name], cfg)
                     n_quant += 1
                     block_done(name)
-                else:
-                    continue
+        if shards is not None:
+            shards.release(shard)
+    assert temb is not None, "time_embedder の重みが見つかりません"
     assert not pending_adaln, f"AdaLN の重みが揃わないブロック: {sorted(pending_adaln)}"
     # init_empty_weights はパラメータだけを meta にし、非永続バッファ(rope.inv_freq)は CPU に残すので GPU へ移す。
     # state_dict に入るバッファ(ブロックの量子化重み・AdaLN テーブル。stream_blocks のとき CPU に置いてある)は触らない。
@@ -853,13 +863,13 @@ def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = Fals
 
 def load_transformer(repo: str, pipe, device: torch.device, cache_dir: Path, quant: str = "int8wo",
                      lora_path: str | None = None, stream_blocks: bool = False, pin_blocks: bool = True,
-                     drop_blocks: str = "auto", file_blocks: bool = False):
-    """キャッシュがあれば読む、無ければ構築して保存する(bnb-int8 は毎回構築)。"""
+                     drop_blocks: str = "auto", file_blocks: bool = False, shards=None):
+    """キャッシュがあれば読む、無ければ構築して保存する(bnb-int8 は毎回構築)。shards: build_fresh 参照。"""
     keys = timestep_keys(pipe)
     logger.info("AdaLN timestep keys: %s", keys.tolist())
     if quant == "bnb-int8":
         return build_fresh(repo, device, keys, verify=True, quant=quant, lora_path=lora_path,
-                           stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks)
+                           stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks, shards=shards)
     if cache_exists(cache_dir):
         tr = load_cache(cache_dir, device, stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks,
                         file_blocks=file_blocks)
@@ -870,7 +880,7 @@ def load_transformer(repo: str, pipe, device: torch.device, cache_dir: Path, qua
         return tr
     tr = build_fresh(repo, device, keys, verify=True, quant=quant, lora_path=lora_path,
                      stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks,
-                     spill_dir=cache_dir.with_name(cache_dir.name + ".tmp"))
+                     spill_dir=cache_dir.with_name(cache_dir.name + ".tmp"), shards=shards)
     save_cache(tr, cache_dir)
     return tr
 

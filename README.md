@@ -112,9 +112,11 @@ int8wo と同程度です。品質は同一 seed で int8wo と並べて目視�
 
 - NVIDIA GPU(上記)。sm_120(Blackwell)で検証。torch 2.11.0+cu130 のため CUDA 13 系ドライバが必要
 - Python 3.12、[uv](https://github.com/astral-sh/uv)(pip でも可)
-- ディスク: 本家モデル 64GB(HF キャッシュ)+ LoRA 1.4GB + 量子化済み text_encoder 17GB +
-  transformer キャッシュ 19GiB(int8wo)または 10.7GiB(ck-w4a8)× 使うステップ種。
-  **text_encoder の作成時のみ一時的に +66.7GB**(bf16 ソース。`--delete-te-source` で作成後に削除可)
+- ディスク(常駐分): VAE などの本家モデルの小さい部分 2.5GB + LoRA 1.4GB + 量子化済み text_encoder 17GB +
+  transformer キャッシュ 19GiB(int8wo)または 10.7GiB(ck-w4a8)× 使うステップ種 = **ck-w4a8 なら約 32GB**。
+  bf16 のソース(text_encoder 66.7GB・transformer 62GB)は**シャード(5GB)を 1 つずつ落として量子化し、
+  使い終わったら消す**ので、準備中のディスクのピークは常駐分 + 5GB 程度です(`--keep-source` で全部残すこともできます。
+  別のステップ種のキャッシュを後から作るときに再ダウンロードしなくて済みます)
 - モデルの準備(`prepare_models.py`)も低 VRAM で動きます: text_encoder の nf4 量子化は層ごとに行い VRAM 0.3GB・RAM 1GB、
   transformer の量子化キャッシュ構築は 6GB 級でも VRAM 2GB・RAM 3GB(RAM 12GB 上限で実測)。
   **6GB の GPU・16GB の RAM の PC だけで、ダウンロードから生成まで完結します**(ディスクは必要)
@@ -128,7 +130,7 @@ uv pip install --python .venv/bin/python -r requirements.txt
 # uv を使わない場合: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # モデル類の準備(初回のみ。本家モデル 64GB + LoRA のダウンロードと text_encoder の量子化。GPU が必要、VRAM は 1GB 未満)
-.venv/bin/python scripts/prepare_models.py --delete-te-source
+.venv/bin/python scripts/prepare_models.py
 
 # 任意: transformer の量子化キャッシュを先に作っておく(省略すると初回生成時に自動構築)
 .venv/bin/python scripts/prepare_models.py --skip-download --build-cache 3
@@ -160,7 +162,7 @@ uv を使う場合(uv は `powershell -ExecutionPolicy ByPass -c "irm https://as
 git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
 uv venv --python 3.12 .venv
 uv pip install --python .venv\Scripts\python.exe -r requirements-windows.txt
-.venv\Scripts\python.exe scripts\prepare_models.py --delete-te-source     # モデルの準備(GPU が必要)
+.venv\Scripts\python.exe scripts\prepare_models.py     # モデルの準備(GPU が必要、VRAM は 1GB 未満)
 .\run.ps1                                                                 # http://127.0.0.1:8633/
 ```
 
@@ -171,7 +173,7 @@ git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
 py -3.12 -m venv .venv                      # py が無ければ python -m venv .venv(3.12 系であること)
 .venv\Scripts\python.exe -m pip install --upgrade pip
 .venv\Scripts\python.exe -m pip install -r requirements-windows.txt
-.venv\Scripts\python.exe scripts\prepare_models.py --delete-te-source
+.venv\Scripts\python.exe scripts\prepare_models.py
 .\run.ps1
 ```
 
@@ -345,6 +347,7 @@ system prompt とし、さらに上記 skill のガイド本文(`references/t2i-
 | `H3IMG_TE_HOST` | auto | text_encoder の原本: `pinned`(速い、RAM 約 13GB)/ `file`(層ごとにファイルから直接読む。RAM の少ない PC 向け、OS を問わない)/ `mmap`(ページキャッシュ + madvise、Linux のみ)。auto は搭載 48GB 以上で pinned、未満で file |
 | `H3IMG_TRANSFORMER_HOST` | auto | transformer ブロックの原本(8gb 構成): `pinned`(RAM 約 10GB)/ `file`・`mmap`(量子化キャッシュのページキャッシュから流し、収まらない分は読み直す。RAM 16GB の PC 向け)。auto は TE と同じ規則 |
 | `H3IMG_TRANSFORMER_DROP_BLOCKS` | auto | `file` / `mmap` のとき、使い終わったら捨てる(file なら直接読む)末尾ブロック数。auto = キャッシュに使える RAM からはみ出す分だけ。0 で捨てない |
+| `H3IMG_KEEP_SOURCE` | 0 | 1 にすると、キャッシュ構築時に 1 つずつダウンロードした transformer の bf16 シャードを消さずに残す(元から置いてあるファイルはどちらでも消さない) |
 | `H3IMG_GENERATION_AREA` | requested | 既定キャンバス(`native` = 最低 4MP) |
 | `H3IMG_PRELOAD` | 0 | 1 で起動時にロード |
 | `H3IMG_MODELS_DIR` | `./models` | te / lora / cache の置き場 |

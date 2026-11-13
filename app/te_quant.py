@@ -35,10 +35,11 @@ def _shard_name(key: str, n_layers: int) -> str:
 
 
 def quantize_tensors(src_dir: Path, n_layers: int, device: torch.device, linear_weights: set[str],
-                     wanted: set[str]):
+                     wanted: set[str], source=None):
     """bf16 シャードを順に読み、(キー, テンソル群 dict) を yield する。
     linear_weights のキーは nf4 化して {key: packed uint8, key.absmax, key.quant_map, key.quant_state.bitsandbytes__nf4}、
-    それ以外は bf16 のまま {key: tensor}。wanted に無いキー(52 層目以降など)は読まない。"""
+    それ以外は bf16 のまま {key: tensor}。wanted に無いキー(52 層目以降など)は読まない。
+    source(ShardSource)があれば、シャードは fetch() で取得し読み終わったら release() する(1 つずつダウンロード)。"""
     import bitsandbytes as bnb
     from safetensors import safe_open
 
@@ -48,7 +49,8 @@ def quantize_tensors(src_dir: Path, n_layers: int, device: torch.device, linear_
         if key in wanted:
             by_shard.setdefault(shard, []).append(key)
     for shard in sorted(by_shard):
-        with safe_open(str(src_dir / shard), framework="pt", device="cpu") as f:
+        path = source.fetch(shard) if source is not None else src_dir / shard
+        with safe_open(str(path), framework="pt", device="cpu") as f:
             for key in by_shard[shard]:
                 t = f.get_tensor(key)
                 if key in linear_weights:
@@ -61,10 +63,14 @@ def quantize_tensors(src_dir: Path, n_layers: int, device: torch.device, linear_
                 else:
                     out = {key: t.to(torch.bfloat16).contiguous()}
                 yield key, out
+        if source is not None:
+            source.release(shard)
 
 
-def build(src_dir: Path, dst_dir: Path, n_layers: int, device: torch.device, log=logger.info, source=None) -> None:
-    """src_dir(本家 text_encoder、bf16 シャード)→ dst_dir(nf4、層ごとのシャード)。dst_dir.tmp に書いてから rename。
+def build(src_dir: Path, dst_dir: Path, n_layers: int, device: torch.device, log=logger.info, source=None,
+          shards=None) -> None:
+    """src_dir(本家 text_encoder の config / index がある場所)→ dst_dir(nf4、層ごとのシャード)。dst_dir.tmp に書いてから rename。
+    shards: ShardSource(bf16 シャードを 1 つずつダウンロードして消す)。None なら src_dir にある前提。
     source: テスト用に (キー, {名前: テンソル}) の反復子を差し替える(既定は quantize_tensors)。"""
     from accelerate import init_empty_weights
     from safetensors.torch import save_file
@@ -109,7 +115,7 @@ def build(src_dir: Path, dst_dir: Path, n_layers: int, device: torch.device, log
             total += v.numel() * v.element_size()
 
     if source is None:
-        source = quantize_tensors(src_dir, n_layers, device, linear_weights, wanted)
+        source = quantize_tensors(src_dir, n_layers, device, linear_weights, wanted, source=shards)
     for key, tensors in source:
         name = _shard_name(key, n_layers)
         pending.setdefault(name, {}).update(tensors)

@@ -52,6 +52,9 @@ class Settings:
     model_id: str = _env("H3IMG_MODEL_ID", "MiniMaxAI/MiniMax-H3-Image")
     # ローカルのスナップショットを直接指す場合(未指定なら HF キャッシュの最新スナップショット)
     model_dir: str = _env("H3IMG_MODEL_DIR", "")
+    # 量子化キャッシュの構築時に 1 つずつダウンロードした bf16 シャードを、読み終わっても消さない(既定は消す。
+    # 元から HF キャッシュにあるファイルはどちらでも消さない)
+    keep_source: bool = _env("H3IMG_KEEP_SOURCE", "0") == "1"
     models_dir: Path = Path(_env("H3IMG_MODELS_DIR", str(BASE_DIR / "models")))
     # 使う GPU: H3IMG_GPU=1 のように番号で指定(H3IMG_DEVICE=cuda:1 と同じ)。TE は H3IMG_TE_GPU / H3IMG_TE_DEVICE。
     # 既定: transformer は cuda:0、TE は GPU が 2 枚以上あれば cuda:1(engine 側で解決)
