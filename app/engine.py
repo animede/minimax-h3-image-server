@@ -466,6 +466,40 @@ class Engine:
             self.transformer = self._load_transformer(steps)
             self.loaded_steps = steps
             self.pipe.update_components(transformer=self.transformer, text_encoder=self.te, vae=self.vae)
+            self._apply_reference_cap()
+
+    _reference_cap_px: float | None = None
+
+    def _apply_reference_cap(self) -> None:
+        """編集の参照画像 1 枚あたりの画素数の上限を構成に合わせる。上限があるときは、本家の resize step の
+        「短辺を 1024 以上に揃える」(小さい画像の拡大)を止め(min を 32 に)、参照は _fit_references() で縮める。"""
+        v = self.s.reference_max_megapixels
+        if v == "auto":
+            cap = 1.05 if self.profile.name in ("8gb", "16gb") else None
+        else:
+            cap = float(v) if float(v) > 0 else None
+        self._reference_cap_px = cap * 1e6 if cap else None
+        if self._reference_cap_px:
+            self.pipe.update_components(reference_min_short_edge=32, vision_min_short_edge=32,
+                                        reference_max_short_edge=4096)
+            logger.info("edit references: capped at %.2f MP each, no upscaling (profile %s)", cap, self.profile.name)
+
+    def _fit_references(self, images: list) -> list:
+        """参照画像を上限画素数以下・両辺 32 の倍数に縮める(縦横比は保つ、拡大はしない)。"""
+        if not self._reference_cap_px:
+            return images
+        from PIL import Image, ImageOps
+        out = []
+        for im in images:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            w, h = im.size
+            scale = min(1.0, (self._reference_cap_px / (w * h)) ** 0.5)
+            nw, nh = max(32, round(w * scale / 32) * 32), max(32, round(h * scale / 32) * 32)
+            if (nw, nh) != (w, h):
+                logger.info("edit reference resized %dx%d -> %dx%d", w, h, nw, nh)
+                im = im.resize((nw, nh), Image.LANCZOS)
+            out.append(im)
+        return out
 
     def _drop_transformer(self) -> None:
         """旧 transformer への参照を全て切って VRAM を解放する。
@@ -568,6 +602,7 @@ class Engine:
         if area == "requested":
             kw["min_generation_area"] = 1024  # 4MP 最低キャンバスを無効化(要求サイズで生成)
         if images:
+            images = self._fit_references(images)
             kw["image"] = images if len(images) > 1 else images[0]
         seed = req.seed if req.seed is not None else int(torch.randint(0, 2**31 - 1, (1,)).item())
         kw["generator"] = torch.Generator().manual_seed(seed)

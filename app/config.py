@@ -56,6 +56,11 @@ class Settings:
     # 量子化キャッシュの構築時に 1 つずつダウンロードした bf16 シャードを、読み終わっても消さない(既定は消す。
     # 元から HF キャッシュにあるファイルはどちらでも消さない)
     keep_source: bool = _env("H3IMG_KEEP_SOURCE", "0") == "1"
+    # 編集の参照画像 1 枚あたりの画素数の上限(万画素、縦横比は保つ)。本家の resize step は短辺を 1024〜2048 に揃える
+    # (小さい画像は 1024 まで拡大、4K は短辺 2048 のまま)ので、縦長・横長の小さい画像や 4K の写真はトークン数が
+    # 正方形 1024² の数倍になり、8gb / 16gb 構成では TE や denoise で OOM する(実測)。この上限を超える参照は縮小し、
+    # 上限以下の小さい画像は拡大しない。auto = 8gb / 16gb 構成なら 105(≒1024²)、それ以外は本家どおり(上限なし)
+    reference_max_megapixels: str = _env("H3IMG_REFERENCE_MAX_MEGAPIXELS", "auto")
     models_dir: Path = Path(_env("H3IMG_MODELS_DIR", str(BASE_DIR / "models")))
     # 使う GPU: H3IMG_GPU=1 のように番号で指定(H3IMG_DEVICE=cuda:1 と同じ)。TE は H3IMG_TE_GPU / H3IMG_TE_DEVICE。
     # 既定: transformer は cuda:0、TE は GPU が 2 枚以上あれば cuda:1(engine 側で解決)

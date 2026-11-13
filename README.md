@@ -354,6 +354,7 @@ system prompt とし、さらに上記 skill のガイド本文(`references/t2i-
 | `H3IMG_TE_HOST` | auto | text_encoder の原本: `pinned`(速い、RAM 約 13GB)/ `file`(層ごとにファイルから直接読む。RAM の少ない PC 向け、OS を問わない)/ `mmap`(ページキャッシュ + madvise、Linux のみ)。auto は搭載 48GB 以上で pinned、未満で file |
 | `H3IMG_TRANSFORMER_HOST` | auto | transformer ブロックの原本(8gb 構成): `pinned`(RAM 約 10GB)/ `file`・`mmap`(量子化キャッシュのページキャッシュから流し、収まらない分は読み直す。RAM 16GB の PC 向け)。auto は TE と同じ規則 |
 | `H3IMG_TRANSFORMER_DROP_BLOCKS` | auto | `file` / `mmap` のとき、使い終わったら捨てる(file なら直接読む)末尾ブロック数。auto = キャッシュに使える RAM からはみ出す分だけ。0 で捨てない |
+| `H3IMG_REFERENCE_MAX_MEGAPIXELS` | auto | 編集の参照画像 1 枚あたりの画素数の上限(万画素単位ではなく MP。小さい画像は拡大しない)。auto = 8gb / 16gb 構成で 1.05、それ以外は上限なし。0 で上限なし |
 | `H3IMG_KEEP_SOURCE` | 0 | 1 にすると、キャッシュ構築時に 1 つずつダウンロードした transformer の bf16 シャードを消さずに残す(元から置いてあるファイルはどちらでも消さない) |
 | `H3IMG_GENERATION_AREA` | requested | 既定キャンバス(`native` = 最低 4MP) |
 | `H3IMG_PRELOAD` | 0 | 1 で起動時にロード |
@@ -592,6 +593,13 @@ NVMe は Gen4 で連続読み 2.3GB/s、予備 1GB、出力は pinned 構成と�
   `hidden_states[50]` だけなので、50 番目の層の出力を hook で取ってそこで forward を打ち切ります(出力はピクセル一致)。
   Ada・空き 6GB・RAM 12GB 上限の実測: 参照 1 / 2 / 3 枚(1024²)で 14.4 / 19.2 / 26.4s、peak 2.9GB、参照 2 / 3 枚で
   2048² 出力 29.3 / 41.7s、peak 3.3GB。
+- **参照画像は 1 枚あたり 1024² 相当(1.05MP)に収め、小さい画像は拡大しない**(8gb / 16gb 構成、
+  `H3IMG_REFERENCE_MAX_MEGAPIXELS`、auto)。本家の resize step は短辺を 1024〜2048 に揃えるため、256×524 のような
+  小さい縦長画像は 1024×2096 に拡大され(トークン数は正方形の 2 倍)、4K の写真は短辺 2048 のまま VAE に入り、
+  どちらも 8gb 構成では OOM していました(実測: 256×524 + 679×662 の 2 枚で TE が OOM、3840×2160 の 2 枚で denoise が OOM)。
+  上限を入れた実測(Ada・空き 5GB・RAM 12GB 上限、参照 3 枚まで): 256×524 / 679×662 の組で 1024² 13.5s・2048² 20.2s、
+  400×1600 ×3 で 1024² 18.2s・2048² 27.8s、3840×2160 ×3 で 2048² まで完走、いずれも peak 2.9GB。
+  大きいカードの構成(32gb / 48gb)は本家どおり(上限なし)で、同じ参照でも結果は 8gb / 16gb 構成と異なります。
 - `file` の受け皿(staging)は `pin_memory()`(cudaHostAlloc)ではなく、普通のメモリを `cudaHostRegister` でピン留め
   します。前者は cgroup に "file" として計上され、ページキャッシュの予算計算(匿名メモリを差し引く)から漏れて
   transformer を押し出していました(実測で読み直しが 28GB に増えた)。

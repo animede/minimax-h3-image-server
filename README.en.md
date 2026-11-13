@@ -372,6 +372,7 @@ are fetched into `models/prompts/` from the PE repository and GitHub on first us
 | `H3IMG_TE_HOST` | auto | Text-encoder weights: `pinned` (fast, ~13GB of RAM) / `file` (each layer read straight from the file; for PCs with little RAM, any OS) / `mmap` (page cache + madvise, Linux only). auto = pinned with ≥48GB of RAM, otherwise file |
 | `H3IMG_TRANSFORMER_HOST` | auto | Transformer blocks (8gb profile): `pinned` (~10GB of RAM) / `file` or `mmap` (streamed from the quantization cache's page cache, overflow re-read from disk; for PCs with 16GB of RAM). auto follows the TE rule |
 | `H3IMG_TRANSFORMER_DROP_BLOCKS` | auto | With `file` / `mmap`, how many trailing blocks to re-read (file) or drop (mmap) after use. auto = only the overflow that does not fit in RAM; 0 = never |
+| `H3IMG_REFERENCE_MAX_MEGAPIXELS` | auto | Per-reference pixel cap for edits (MP; smaller images are not upscaled). auto = 1.05 on the 8gb / 16gb profiles, no cap otherwise; 0 = no cap |
 | `H3IMG_KEEP_SOURCE` | 0 | Set to 1 to keep the transformer bf16 shards downloaded one by one during the cache build (files that were already present are never deleted either way) |
 | `H3IMG_GENERATION_AREA` | requested | Default canvas (`native` = at least 4MP) |
 | `H3IMG_PRELOAD` | 0 | 1 = load at startup |
@@ -630,6 +631,14 @@ pinned configuration:
   the 8gb profile. Only `hidden_states[50]` is used, so a hook captures the 50th layer's output and stops the forward
   there (outputs are pixel-identical). Measured on the Ada card with 6GB free and a 12GB RAM cap: 1 / 2 / 3 references
   at 1024² in 14.4 / 19.2 / 26.4 s (peak 2.9GB), 2 / 3 references with 2048² output in 29.3 / 41.7 s (peak 3.3GB).
+- **Reference images are limited to about 1024² (1.05 MP) each and small images are not upscaled** (8gb / 16gb
+  profiles, `H3IMG_REFERENCE_MAX_MEGAPIXELS`, auto). The official resize step normalizes the short edge to 1024–2048,
+  so a small portrait such as 256×524 is upscaled to 1024×2096 (twice the tokens of a square) and a 4K photo enters the
+  VAE with a 2048 short edge; both ran out of memory on the 8gb profile (measured: 256×524 + 679×662 OOM in the text
+  encoder, two 3840×2160 photos OOM in the denoise). With the cap (Ada, 5GB free, 12GB RAM cap, up to 3 references):
+  256×524 / 679×662 in 13.5 s @1024² and 20.2 s @2048², three 400×1600 in 18.2 s / 27.8 s, three 3840×2160 through
+  2048², all at a 2.9GB peak. The 32gb / 48gb profiles keep the official behaviour (no cap), so the same references
+  give different results than on the 8gb / 16gb profiles.
 - The `file` staging buffers are ordinary memory pinned with `cudaHostRegister`, not `pin_memory()` (cudaHostAlloc):
   the latter is charged to the cgroup as "file" memory, which escaped the page-cache budget (it subtracts anonymous
   memory) and pushed the transformer out of the cache (re-reads rose to 28GB in measurements).
