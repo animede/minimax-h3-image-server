@@ -450,6 +450,7 @@ class Engine:
         del old
         gc.collect()
         unpinned = pruned_image.release_pinned("transformer")
+        pruned_image.release_file_streamers("transformer")
         torch.cuda.empty_cache()
         logger.info("transformer dropped, alloc=%.2fGB, unpinned=%.1fGB",
                     torch.cuda.memory_allocated(self.device) / 2**30, unpinned)

@@ -704,7 +704,8 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
                                 ref = lin(F.silu(temb).to(torch.bfloat16))
                             assert torch.equal(ref, table), "AdaLN テーブルが元の射影と bit 一致しません"
                             verified = True
-                            del lin
+                            del lin, ref
+                            torch.cuda.empty_cache()
                         tab = AdaLNTable(keys.clone(), table, hidden)
                         _replace_adaln(tr, bi, tab.to("cpu") if stream_blocks else tab)
                         del pending_adaln[bi], slot
@@ -772,11 +773,8 @@ def save_cache(tr, cache_dir: Path) -> None:
     sd = {k: v.detach().cpu() for k, v in tr.state_dict().items()}
     out = _save_state(sd, tmp)
     del sd
-    if out.name == STATE_FILENAME_ST:
-        # ビルド中に書き出したブロック単位のファイル(mmap で参照中)を本体に差し替えてから消す
-        tr.load_state_dict(_load_state(tmp), assign=True)
-        for p in sorted(tmp.glob("block-*.safetensors")):
-            p.unlink()
+    # ビルド中に書き出したブロック単位のファイル(block-*.safetensors)は tr がまだ mmap で参照しているので
+    # ここでは消さない(Windows はマップ中のファイルを消せない)。呼び出し側が tr を捨ててから消す。
     if cache_dir.exists():
         import shutil
         shutil.rmtree(cache_dir)
@@ -882,7 +880,18 @@ def load_transformer(repo: str, pipe, device: torch.device, cache_dir: Path, qua
                      stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks,
                      spill_dir=cache_dir.with_name(cache_dir.name + ".tmp"), shards=shards)
     save_cache(tr, cache_dir)
-    return tr
+    # ビルドしたモデルはそのまま使わず、保存したキャッシュから読み直す(初回と 2 回目以降で同じ経路にする。
+    # ビルド中に差し込んだストリーミングの hook は spill 前のテンソルを指していて、そのままでは使えない)
+    del tr
+    import gc
+    gc.collect()
+    release_pinned("transformer")
+    release_file_streamers("transformer")
+    torch.cuda.empty_cache()
+    for p in sorted(cache_dir.glob("block-*.safetensors")):
+        p.unlink()
+    return load_cache(cache_dir, device, stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks,
+                      file_blocks=file_blocks)
 
 
 def tabulate_adaln(tr, repo: str, keys: torch.Tensor, device: torch.device) -> None:
