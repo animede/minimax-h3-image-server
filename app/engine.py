@@ -126,6 +126,7 @@ class Engine:
             "transformer_streamed": self.transformer_streamed,
             "host_pinned_gb": pruned_image.pinned_gb(),
             "te_host": getattr(self, "te_host", None),
+            "transformer_host": getattr(self, "transformer_host", None),
             "vae_on_gpu": getattr(self, "vae_on_gpu", None),
             "embed_on_gpu": getattr(self, "embed_on_gpu", None),
             "vram_alloc_gb": round(torch.cuda.memory_allocated(self.device) / 2**30, 2),
@@ -223,12 +224,15 @@ class Engine:
         if te_stream and self.vae_on_gpu:
             headroom -= VAE_GPU_GB
         self.embed_on_gpu = te_stream and headroom >= EMBED_GPU_GB
-        self.te_host = (self.s.te_host if self.s.te_host != "auto" else
-                        ("pinned" if _host_ram_gb() >= TE_PINNED_MIN_HOST_GB else "mmap")) if te_stream else None
+        auto_host = "pinned" if _host_ram_gb() >= TE_PINNED_MIN_HOST_GB else "mmap"
+        self.te_host = (self.s.te_host if self.s.te_host != "auto" else auto_host) if te_stream else None
+        self.transformer_host = (self.s.transformer_host if self.s.transformer_host != "auto" else auto_host) \
+            if tr_stream else None
         logger.info("VRAM profile: %s (budget %.1fGB = min(requested %.1f, free %.1f - reserve %.1f), TE %s) -> quant=%s "
-                    "te_stream=%s(%s) transformer_stream=%s vae_on_gpu=%s embed_on_gpu=%s", prof.name, budget, requested,
-                    free_gb, self.s.vram_reserve_gb, "split" if split else "same GPU", prof.quant, prof.te_stream,
-                    self.te_host, prof.transformer_stream, self.vae_on_gpu, self.embed_on_gpu)
+                    "te_stream=%s(%s) transformer_stream=%s(%s) vae_on_gpu=%s embed_on_gpu=%s", prof.name, budget,
+                    requested, free_gb, self.s.vram_reserve_gb, "split" if split else "same GPU", prof.quant,
+                    prof.te_stream, self.te_host, prof.transformer_stream, self.transformer_host, self.vae_on_gpu,
+                    self.embed_on_gpu)
         return prof
 
     def _cap_allocator(self, budget_gb: float) -> None:
@@ -357,7 +361,7 @@ class Engine:
         stream = self._transformer_stream_enabled()
         tr = pruned_image.load_transformer(self._resolve_repo(), self.pipe, self.device,
                                            self.s.cache_dir / cache_name, quant=quant, lora_path=lora,
-                                           stream_blocks=stream)
+                                           stream_blocks=stream, pin_blocks=self.transformer_host != "mmap")
         self.transformer_streamed = stream
         self._install_progress_hook(tr, steps)
         logger.info("transformer (steps=%d) ready in %.1fs, alloc=%.2fGB", steps, time.time() - t0,

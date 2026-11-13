@@ -186,6 +186,7 @@ H3IMG_VRAM_FALLBACK=0 ./run.sh
 | `H3IMG_VRAM_FALLBACK` | `1` / `0` | 生成中の OOM で一段下のプロファイルへ自動で下げる |
 | `H3IMG_VRAM_RESERVE_GB` | 数値(既定 1.0) | 必ず空けておく VRAM(画面表示などの分) |
 | `H3IMG_TE_HOST` | `auto` / `pinned` / `mmap` | text_encoder の原本の置き場所(mmap は RAM 32GB の PC 向け) |
+| `H3IMG_TRANSFORMER_HOST` | `auto` / `pinned` / `mmap` | transformer ブロックの原本の置き場所(mmap は RAM 16GB の PC 向け、ディスク速度に依存) |
 
 | プロファイル | 量子化 | TE | transformer | 要る予算 | 速度(1024² / 2048²、TE は pinned) |
 |---|---|---|---|---|---|
@@ -294,6 +295,7 @@ system prompt とし、さらに上記 skill のガイド本文(`references/t2i-
 | `H3IMG_VRAM_FALLBACK` | 1 | 生成中の CUDA OOM で一段下のプロファイルへ自動で下げてやり直す |
 | `H3IMG_VRAM_RESERVE_GB` | 1.0 | 予算から差し引いて必ず空けておく VRAM(画面表示・他のアプリ用) |
 | `H3IMG_TE_HOST` | auto | text_encoder の原本: `pinned`(速い、RAM 約 13GB)/ `mmap`(ページキャッシュ、RAM の少ない PC 向け)。auto は搭載 48GB 以上で pinned |
+| `H3IMG_TRANSFORMER_HOST` | auto | transformer ブロックの原本(8gb 構成): `pinned`(RAM 約 10GB)/ `mmap`(量子化キャッシュのページキャッシュから流す。RAM 16GB の PC 向け、毎生成でディスクから読み直す)。auto は TE と同じ規則 |
 | `H3IMG_GENERATION_AREA` | requested | 既定キャンバス(`native` = 最低 4MP) |
 | `H3IMG_PRELOAD` | 0 | 1 で起動時にロード |
 | `H3IMG_MODELS_DIR` | `./models` | te / lora / cache の置き場 |
@@ -490,6 +492,28 @@ GPU から外したものはホスト RAM に置きます。最初の実装は 8
 | 16GB | pinned | 14.1GB | 1.7GB | 18.3GB | 1.3s | 3.5s | 6.2s |
 
 **RAM 32GB の PC では `mmap`(既定で自動選択)**、48GB 以上なら `pinned` で速くなります。
+
+### RAM 16GB・GPU 6GB の PC(transformer もページキャッシュから流す)
+
+`H3IMG_TRANSFORMER_HOST=mmap` にすると、transformer の 50 ブロックも量子化キャッシュのページキャッシュから直接流し、
+必須のホスト RAM は **約 1.8GB**(プロセスの匿名メモリ)まで下がります。代わりに、RAM に収まらない分は
+**生成のたびにディスクから読み直す**ので、速度はディスクの連続読み出し速度で決まります。
+
+実測(RTX 4000 SFF Ada 20GB の空きを 6GB に制限、プロセスのメモリ上限 12GB = RAM 16GB の PC 相当、
+NVMe は Gen4 で連続読み 2.3GB/s、予備 1GB、出力は pinned 構成とピクセル一致):
+
+| 構成 | 1024² | 2048² | 編集 1664×2496 | 1 枚あたりのディスク読み込み | 必須 RAM |
+|---|---|---|---|---|---|
+| pinned(RAM 制限なし、同じ Ada カード) | 8.2s | 12.7s | 24.3s | 0 | 27GB |
+| mmap × mmap、RAM 12GB 上限 | 17.8s | 20.5s | 31.2s | 24〜25GB | 1.8GB |
+
+- 差の約 10 秒は 24GB ÷ 2.3GB/s で、**ディスクの速度そのもの**です(`madvise(MADV_WILLNEED)` による先読みを入れても
+  変わりませんでした)。連続読み 7GB/s 級の NVMe なら +3〜4 秒に縮む計算です。SATA SSD では +50 秒前後になります。
+- RAM 12GB の上限では transformer 10GB + text_encoder 13GB がページキャッシュに収まらず、毎回ほぼ全部を読み直します。
+  RAM 32GB なら片方が残るので読み直しは半分以下になります。
+- 上の Ada の数値は、このプロジェクトで初めての Blackwell 以外・70W の小型カードでの実測です(x4 接続)。W4A8 カーネル
+  (comfy-kitchen)は sm_89 でも動き、単層で bf16 の 1.9 倍速でした。Blackwell とは数値が異なるので出力はピクセル一致
+  しません(平均差 7/255 程度、構図は同じ)。
 
 ### 試して採らなかったこと
 

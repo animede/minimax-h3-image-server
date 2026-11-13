@@ -296,6 +296,35 @@ def to_host(masters: list) -> None:
         _set(sl, pinned)
 
 
+def _make_readahead(masters: list):
+    """mmap 上の原本に対して madvise(MADV_WILLNEED) を出す関数を返す。ディスクからの読み込みを GPU の計算と
+    重ねるためのもの(ページキャッシュから流す構成では、これが無いとブロックごとにページフォールトで
+    読み込みを待つ)。失敗しても動作には影響しないので黙って無効化する。"""
+    import ctypes
+    import mmap as _mmap
+
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    except OSError:
+        return lambda i: None
+    page = _mmap.PAGESIZE
+    ranges = []
+    for entries in masters:
+        rs = []
+        for _, t in entries:
+            addr, nb = t.data_ptr(), t.numel() * t.element_size()
+            start = addr - addr % page
+            rs.append((start, addr + nb - start))
+        ranges.append(rs)
+
+    def readahead(i: int) -> None:
+        if 0 <= i < len(ranges):
+            for start, length in ranges[i]:
+                libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(length), 3)   # MADV_WILLNEED
+    return readahead
+
+
 def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = True, pin: bool = True) -> None:
     """layers(順に呼ばれる層の列)をピン留めした原本に置き、forward hook で 1 つずつ GPU へ流す。
     層 i の計算中に i+1 を別 stream で先読みする。
@@ -310,10 +339,15 @@ def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = Tru
         # ピン留めしないのでコピーは同期的になるが、OS が回収できるメモリで済む。
         masters.append(pin_module(layer, owner) if pin else [(sl, _get(sl)) for sl in _slots(layer)])
     n = len(masters)
+    readahead = (lambda i: None) if pin else _make_readahead(masters)
     if not prefetch:
         # 先読みなし: 計算と同じ stream でコピーする。解放はストリーム順序で守られるので record_stream が要らず、
-        # アロケータの予約が膨らまない(1 回しか通らない TE 向け)。
+        # アロケータの予約が膨らまない(1 回しか通らない TE 向け)。mmap のときはディスクの先読みだけ出す。
+        index = {id(m): k for k, m in enumerate(masters)}
+
         def pre_sync(mod, args, kwargs, _m=None):
+            k = index[id(_m)]
+            readahead(k + 1); readahead(k + 2); readahead(k + 3)
             to_device(_m, device)
 
         def post_sync(mod, args, out, _m=None):
@@ -342,6 +376,7 @@ def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = Tru
             events[i] = None
             if i + 1 < n:
                 prefetch(i + 1)
+            readahead(i + 2); readahead(i + 3); readahead(i + 4)   # mmap のとき: 数ブロック先をディスクから先読み(非同期)
         return pre
 
     def make_post(i: int):
@@ -354,9 +389,10 @@ def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = Tru
         layer.register_forward_hook(make_post(i))
 
 
-def install_block_streaming(tr, device: torch.device) -> None:
-    """transformer_blocks(50 個、ck-w4a8 で各 ~0.2GB)を先読みしながら流す(8gb 構成)。"""
-    stream_layers(tr.transformer_blocks, device, owner="transformer")
+def install_block_streaming(tr, device: torch.device, pin: bool = True) -> None:
+    """transformer_blocks(50 個、ck-w4a8 で各 ~0.2GB)を先読みしながら流す(8gb 構成)。
+    pin=False なら原本は量子化キャッシュの mmap(ページキャッシュ)のまま(RAM の少ない PC 向け)。"""
+    stream_layers(tr.transformer_blocks, device, owner="transformer", pin=pin)
 
 
 def _replace_quant_targets_with_ck_shells(tr) -> None:
@@ -385,7 +421,8 @@ def load_lora_pairs(lora_path: str) -> tuple[dict[str, tuple[torch.Tensor, torch
 
 
 def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: bool = True,
-                quant: str = "int8wo", lora_path: str | None = None, stream_blocks: bool = False):
+                quant: str = "int8wo", lora_path: str | None = None, stream_blocks: bool = False,
+                pin_blocks: bool = True):
     """bf16 シャードから量子化済み transformer を組み立てる(1 テンソルずつ GPU へ)。
 
     quant="int8wo": torchao Int8WeightOnly(キャッシュ可。eager では bf16 へ逆量子化してから
@@ -481,7 +518,7 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
             mod_name, _, attr = name.rpartition(".")
             dict(tr.named_modules())[mod_name].register_buffer(attr, buf.to(device), persistent=False)
     if stream_blocks:
-        install_block_streaming(tr, device)
+        install_block_streaming(tr, device, pin=pin_blocks)
     torch.cuda.empty_cache()
     install_forward_wrapper(tr)
     tr.eval()
@@ -507,7 +544,7 @@ def save_cache(tr, cache_dir: Path) -> None:
     logger.info("cache saved: %s (%.1fGiB)", cache_dir, size)
 
 
-def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = False):
+def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = False, pin_blocks: bool = True):
     from accelerate import init_empty_weights
     from diffusers import MiniMaxH3ImageTransformer2DModel as Cls
 
@@ -529,7 +566,7 @@ def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = Fals
         for name, child in tr.named_children():
             if name != "transformer_blocks":
                 child.to(device)
-        install_block_streaming(tr, device)
+        install_block_streaming(tr, device, pin=pin_blocks)
     else:
         tr = tr.to(device)
     install_forward_wrapper(tr)
@@ -540,22 +577,22 @@ def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = Fals
 
 
 def load_transformer(repo: str, pipe, device: torch.device, cache_dir: Path, quant: str = "int8wo",
-                     lora_path: str | None = None, stream_blocks: bool = False):
+                     lora_path: str | None = None, stream_blocks: bool = False, pin_blocks: bool = True):
     """キャッシュがあれば読む、無ければ構築して保存する(bnb-int8 は毎回構築)。"""
     keys = timestep_keys(pipe)
     logger.info("AdaLN timestep keys: %s", keys.tolist())
     if quant == "bnb-int8":
         return build_fresh(repo, device, keys, verify=True, quant=quant, lora_path=lora_path,
-                           stream_blocks=stream_blocks)
+                           stream_blocks=stream_blocks, pin_blocks=pin_blocks)
     if (cache_dir / STATE_FILENAME).exists():
-        tr = load_cache(cache_dir, device, stream_blocks=stream_blocks)
+        tr = load_cache(cache_dir, device, stream_blocks=stream_blocks, pin_blocks=pin_blocks)
         cached = next(m for m in tr.modules() if isinstance(m, AdaLNTable)).keys.cpu()
         if not torch.equal(cached, keys):
             raise RuntimeError(f"キャッシュの時刻集合 {cached.tolist()} が現在の {keys.tolist()} と異なります。"
                                f"{cache_dir} を削除して作り直してください")
         return tr
     tr = build_fresh(repo, device, keys, verify=True, quant=quant, lora_path=lora_path,
-                     stream_blocks=stream_blocks)
+                     stream_blocks=stream_blocks, pin_blocks=pin_blocks)
     save_cache(tr, cache_dir)
     return tr
 
