@@ -109,7 +109,10 @@ see method 6 [below](#how-the-vram-was-reduced-and-the-speed-increased)).
 - Load (on the first generation): text_encoder 3–8 s + transformer cache 6–14 s + VAE 1 s ≈ 20 s. Only the very
   first run without a cache takes about 40 s more (quantizing from the bf16 shards).
 - Quality: 3 steps look nearly identical to 6 steps at 100% zoom. **2 steps show a fine woven pattern**, so use them
-  for previews.
+  for previews. However, **at 1024² with a short prompt such as "mountain and river", 3 steps can also show a grid-like
+  grain on mountainsides and water** (independent of the quantization/streaming configuration: the 8gb and 32gb
+  profiles are pixel-identical and int8wo on 48gb shows the same; 6 steps removes it). For landscapes with large smooth
+  areas, use 6 steps or a detailed prompt written the official way.
 - With `generation_area: "native"` (generate on the officially recommended minimum 4MP canvas, then downscale), 1024²
   takes as long as 2048².
 - For comparison: loading the same weights plainly as bnb int8 (`load_in_8bit` in `from_pretrained`) gives
