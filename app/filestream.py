@@ -147,25 +147,31 @@ class _Reader:
                 if fd is None:
                     fd = self.shared[path] = self._open(path)
             return fd
-        fds = getattr(self.local, "fds", None)
-        if fds is None:
-            fds = self.local.fds = {}
-        fd = fds.get(path)
-        if fd is None:
-            fd = fds[path] = self._open(path)
-        return fd
+        return self._file(path).fileno()
+
+    def _file(self, path: Path):
+        """pread の無い OS(Windows)用: スレッドごとの無バッファ FileIO(seek + readinto で余計なコピーをしない)。"""
+        files = getattr(self.local, "files", None)
+        if files is None:
+            files = self.local.files = {}
+        f = files.get(path)
+        if f is None:
+            f = files[path] = open(self._open(path), "rb", buffering=0)
+        return f
 
     def _read_chunk(self, path: Path, mv: memoryview, offset: int) -> None:
-        fd, got, n = self._fd(path), 0, len(mv)
+        got, n = 0, len(mv)
+        if self.has_pread:
+            fd = self._fd(path)
+        else:
+            f = self._file(path)
         while got < n:
             if self.has_pread:
                 k = os.preadv(fd, [mv[got:]], offset + got)
             else:
-                os.lseek(fd, offset + got, os.SEEK_SET)
-                data = os.read(fd, n - got)            # Windows: 1 回余計にコピーする
-                mv[got:got + len(data)] = data
-                k = len(data)
-            if k <= 0:
+                f.seek(offset + got)
+                k = f.readinto(mv[got:])
+            if not k:
                 raise OSError(f"短い読み込み: {path.name} offset={offset} got={got}/{n}")
             got += k
 

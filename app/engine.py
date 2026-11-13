@@ -370,8 +370,10 @@ class Engine:
                                            file_blocks=self.transformer_host == "file")
         self.transformer_streamed = stream
         self._install_progress_hook(tr, steps)
-        logger.info("transformer (steps=%d) ready in %.1fs, alloc=%.2fGB", steps, time.time() - t0,
-                    torch.cuda.memory_allocated(self.device) / 2**30)
+        total, avail = pruned_image.host_memory_gb()
+        logger.info("transformer (steps=%d) ready in %.1fs, alloc=%.2fGB; host RAM: process %.1fGB, available %.1fGB "
+                    "of %.1fGB, pinned %s", steps, time.time() - t0, torch.cuda.memory_allocated(self.device) / 2**30,
+                    pruned_image._process_anon_gb(), avail, total, pruned_image.pinned_gb())
         return tr
 
     def _install_progress_hook(self, tr, steps: int) -> None:
