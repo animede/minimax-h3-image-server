@@ -10,8 +10,9 @@ streaming on an 8GB-class GPU** (while keeping 1GB of VRAM free: 1.7–2.6 s @10
 2048²-class edit; a setting for PCs with 32GB of RAM is included; outputs are pixel-identical to the fully resident
 configuration). **It also runs on a PC with a 6GB GPU and 16GB of RAM (about 11GB free)**: with the transformer and
 the text encoder streamed straight from the quantization cache's page cache, only ~2GB of RAM is required; each
-generation re-reads 13–20GB from disk, so speed depends on the SSD (Gen4 NVMe, RTX 4000 SFF Ada: 13 s @1024²,
-17 s @2048²; [details](#a-pc-with-16gb-of-ram-and-a-6gb-gpu-streaming-the-transformer-from-the-page-cache-too)).
+generation re-reads 13–20GB from disk, so speed depends on the SSD (**measured on Windows with an RTX 3050 6GB, 16GB
+of RAM and a Gen3 NVMe: about 23 s @1024²**; Linux, Gen4 NVMe, RTX 4000 SFF Ada: 10.5 s @1024², 14.4 s @2048²;
+[details](#a-pc-with-16gb-of-ram-and-a-6gb-gpu-streaming-the-transformer-from-the-file--page-cache-too)).
 Built on diffusers (main). Code is MIT-licensed.
 
 - The original bf16 weights are 66GB (transformer) + 66.7GB (text encoder), which do not fit together even on an 80GB
@@ -149,11 +150,15 @@ downloading:
 
 The contents of `models/` (`te/`, `lora/`, `cache/`) may be symlinks or real directories.
 
-### Windows (untested)
+### Windows
 
 Windows wheels exist for all dependencies (torch 2.11+cu130, comfy-kitchen, bitsandbytes, torchao; use `triton-windows`
 for Triton). The only OS-specific code is reading RAM figures and page-cache hints (`madvise` / `fadvise`); on Windows the
-former uses Win32 APIs and the latter is replaced by `FILE_FLAG_SEQUENTIAL_SCAN`. **Not yet verified on a real Windows machine** (this note will be removed once it is).
+former uses Win32 APIs and the latter is replaced by `FILE_FLAG_SEQUENTIAL_SCAN`.
+**Verified on a real machine**: RTX 3050 6GB, 16GB of RAM (~11GB free), Gen3 DRAM-less NVMe (Samsung PM991a). The `8gb`
+profile (W4A8, TE and transformer both `file`) is selected automatically; 1024² takes about 23 s, of which reading the
+13GB text encoder from disk is ~10 s (1.3GB/s). Output matches Linux in content (not pixel-identical, different GPU
+arithmetic). Write prompts in English (Japanese prompts may be ignored; the UI's "enhance" button converts them).
 
 With uv (install it with `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"` and
 reopen PowerShell afterwards):
@@ -592,6 +597,7 @@ pinned configuration:
 | **file × file, 12GB cap (current default; 5 trailing blocks read from the file)** | **10.5 s** | **14.4 s** | — | 16GB | 2.3GB |
 | same, 11GB cap (10 trailing blocks) | 10.6 s | 14.5 s | — | 19GB | 2.3GB |
 | same, 10GB cap (15 trailing blocks) | 11.1 s | 14.5 s | — | 22GB | 2.3GB |
+| **Windows, real machine: RTX 3050 6GB, 16GB RAM, Gen3 DRAM-less NVMe (1.3GB/s), file × file** | **~23 s** | — | — | 16GB | 2.3GB |
 | mmap × mmap, 12GB cap (previous Linux-only default) | 12.5–12.8 s | 16.6 s | 28.9 s | 13–14GB | 1.8GB |
 | same, 11GB cap (6 trailing blocks dropped) | 13.5 s | 17.3 s | — | 16.7GB | 1.8GB |
 | same, 10GB cap (11 trailing blocks dropped) | 13.9 s | 17.6 s | — | 19.7GB | 1.8GB |

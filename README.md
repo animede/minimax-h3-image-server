@@ -9,7 +9,8 @@
 2048² 級の編集 6.2〜7.0 秒。ホスト RAM 32GB の PC でも動く設定あり。出力は常駐時とピクセル一致)。
 **VRAM 6GB・ホスト RAM 16GB(空き 11GB 程度)の PC でも動きます**: transformer とテキストエンコーダを量子化キャッシュの
 ページキャッシュから直接流す設定で必須の RAM は約 2GB、生成のたびにディスクから 13〜20GB を読み直すため速度はディスク次第
-(Gen4 NVMe・RTX 4000 SFF Ada で 1024² 13 秒・2048² 17 秒。[詳細](#ram-16gbgpu-6gb-の-pctransformer-もページキャッシュから流す))。
+(**Windows・RTX 3050 6GB・RAM 16GB・Gen3 NVMe の実機で 1024² 約 23 秒**、Linux・Gen4 NVMe・RTX 4000 SFF Ada で 1024² 10.5 秒・2048² 14.4 秒。
+[詳細](#ram-16gbgpu-6gb-の-pctransformer-もファイル--ページキャッシュから流す))。
 diffusers(main)ベース、コードは MIT ライセンス。
 
 - 本家の bf16 は transformer 66GB + text_encoder 66.7GB で 80GB GPU にも同時に載りませんが、
@@ -139,11 +140,15 @@ uv pip install --python .venv/bin/python -r requirements.txt
 
 `models/` の中身(`te/` `lora/` `cache/`)は symlink でも実体でも構いません。
 
-### Windows(未検証)
+### Windows
 
 依存パッケージは Windows 用の wheel がそろっています(torch 2.11+cu130、comfy-kitchen、bitsandbytes、torchao。triton は
-`triton-windows`)。コード側の OS 依存は RAM の取得と `madvise` だけで、Windows では前者を Win32 API で代替し、後者は
-行いません。**まだ実機で確認していません**(確認でき次第この注記を外します)。
+`triton-windows`)。コード側の OS 依存は RAM の取得とページキャッシュへの指示(`madvise` / `fadvise`)だけで、Windows では
+前者を Win32 API で代替し、後者は `FILE_FLAG_SEQUENTIAL_SCAN` に置き換えています。
+**実機で確認済み**: RTX 3050 6GB・RAM 16GB(空き約 11GB)・Gen3 DRAM レス NVMe(Samsung PM991a)で、`8gb` 構成
+(W4A8、TE / transformer とも `file`)が自動で選ばれ、1024² が約 23 秒(うち text_encoder のディスク読み 13GB が
+約 10 秒 = 1.3GB/s)。出力は Linux と同じ内容(演算が違うのでピクセル一致はしません)。
+プロンプトは英語で書いてください(日本語のままだと内容が反映されないことがあります。UI の「拡張」で英語に変換できます)。
 
 uv を使う場合(uv は `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"` で入ります。
 インストール後は PowerShell を開き直してください):
@@ -554,6 +559,7 @@ NVMe は Gen4 で連続読み 2.3GB/s、予備 1GB、出力は pinned 構成と�
 | **file × file、RAM 12GB 上限(現行既定、末尾 5 ブロックを直接読む)** | **10.5s** | **14.4s** | — | 16GB | 2.3GB |
 | 同上、RAM 11GB 上限(末尾 10 ブロック) | 10.6s | 14.5s | — | 19GB | 2.3GB |
 | 同上、RAM 10GB 上限(末尾 15 ブロック) | 11.1s | 14.5s | — | 22GB | 2.3GB |
+| **Windows 実機: RTX 3050 6GB・RAM 16GB・Gen3 DRAM レス NVMe(1.3GB/s)、file × file** | **約 23s** | — | — | 16GB | 2.3GB |
 | mmap × mmap、RAM 12GB 上限(Linux 専用の旧既定) | 12.5〜12.8s | 16.6s | 28.9s | 13〜14GB | 1.8GB |
 | 同上、RAM 11GB 上限(末尾 6 ブロックを捨てる) | 13.5s | 17.3s | — | 16.7GB | 1.8GB |
 | 同上、RAM 10GB 上限(末尾 11 ブロックを捨てる) | 13.9s | 17.6s | — | 19.7GB | 1.8GB |
