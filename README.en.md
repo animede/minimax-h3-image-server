@@ -8,7 +8,11 @@ with up to 16 reference images) in **about 21GB of VRAM, at 1.8 s for 1024² and
 quantization and text-encoder layer streaming it **also runs on a single 16GB GPU, and with transformer block
 streaming on an 8GB-class GPU** (while keeping 1GB of VRAM free: 1.7–2.6 s @1024², 3.4–4.2 s @2048², 6.2–7.0 s for a
 2048²-class edit; a setting for PCs with 32GB of RAM is included; outputs are pixel-identical to the fully resident
-configuration). Built on diffusers (main). Code is MIT-licensed.
+configuration). **It also runs on a PC with a 6GB GPU and 16GB of RAM (about 11GB free)**: with the transformer and
+the text encoder streamed straight from the quantization cache's page cache, only ~2GB of RAM is required; each
+generation re-reads 13–20GB from disk, so speed depends on the SSD (Gen4 NVMe, RTX 4000 SFF Ada: 13 s @1024²,
+17 s @2048²; [details](#a-pc-with-16gb-of-ram-and-a-6gb-gpu-streaming-the-transformer-from-the-page-cache-too)).
+Built on diffusers (main). Code is MIT-licensed.
 
 - The original bf16 weights are 66GB (transformer) + 66.7GB (text encoder), which do not fit together even on an 80GB
   GPU. This server keeps the transformer at ~19GB and the text encoder at ~17GB with **a precomputed AdaLN table
@@ -230,6 +234,7 @@ H3IMG_VRAM_FALLBACK=0 ./run.sh
 | `H3IMG_VRAM_FALLBACK` | `1` / `0` | Step down one profile automatically on OOM during generation |
 | `H3IMG_VRAM_RESERVE_GB` | number (default 1.0) | VRAM that is always left free (for the display etc.) |
 | `H3IMG_TE_HOST` | `auto` / `pinned` / `mmap` | Where the text encoder's weights live (`mmap` is for PCs with 32GB of RAM) |
+| `H3IMG_TRANSFORMER_HOST` | `auto` / `pinned` / `mmap` | Where the transformer blocks live (`mmap` is for PCs with 16GB of RAM; speed then depends on the SSD) |
 
 | Profile | Quantization | TE | transformer | Budget needed | Speed (1024² / 2048², TE pinned) |
 |---|---|---|---|---|---|
@@ -346,6 +351,8 @@ are fetched into `models/prompts/` from the PE repository and GitHub on first us
 | `H3IMG_TE_STREAM` | auto | Text-encoder layer streaming (with lm_head removal, CPU embedding and VAE swap). Set 0 / 1 explicitly |
 | `H3IMG_TRANSFORMER_STREAM` | auto | Streaming of the 50 transformer blocks (8GB class). Set 0 / 1 explicitly |
 | `H3IMG_TE_HOST` | auto | Text-encoder weights: `pinned` (fast, ~13GB of RAM) / `mmap` (page cache, for PCs with little RAM). auto = pinned with ≥48GB of RAM |
+| `H3IMG_TRANSFORMER_HOST` | auto | Transformer blocks (8gb profile): `pinned` (~10GB of RAM) / `mmap` (streamed from the quantization cache's page cache; for PCs with 16GB of RAM, re-read from disk every generation). auto follows the TE rule |
+| `H3IMG_TRANSFORMER_DROP_BLOCKS` | auto | With `mmap`, how many trailing blocks to drop from the page cache after use. auto = only the overflow that does not fit in RAM; 0 = never |
 | `H3IMG_GENERATION_AREA` | requested | Default canvas (`native` = at least 4MP) |
 | `H3IMG_PRELOAD` | 0 | 1 = load at startup |
 | `H3IMG_MODELS_DIR` | `./models` | Location of te / lora / cache |
@@ -559,6 +566,42 @@ identical):
 | 16GB | pinned | 14.1GB | 1.7GB | 18.3GB | 1.3 s | 3.5 s | 6.2 s |
 
 **On a PC with 32GB of RAM, `mmap` is used (selected automatically)**; with 48GB or more, `pinned` is faster.
+
+### A PC with 16GB of RAM and a 6GB GPU (streaming the transformer from the page cache too)
+
+With `H3IMG_TRANSFORMER_HOST=mmap`, the 50 transformer blocks are also streamed straight from the quantization cache's
+page cache, and the required host RAM drops to **about 1.8GB** (the process's anonymous memory). In exchange, whatever
+does not fit in RAM is **re-read from disk on every generation**, so speed is set by the SSD's sequential read rate.
+
+Measured on an RTX 4000 SFF Ada 20GB with its free memory capped at 6GB and the process limited to 12GB of memory
+(equivalent to a 16GB PC), on a Gen4 NVMe reading at 2.3GB/s, with a 1GB reserve; outputs are pixel-identical to the
+pinned configuration:
+
+| Configuration | 1024² | 2048² | Edit 1664×2496 | Disk read per image | Required RAM |
+|---|---|---|---|---|---|
+| pinned (no RAM cap, same Ada card) | 8.2 s | 12.7 s | 24.3 s | 0 | 27GB |
+| mmap × mmap, 12GB cap (current) | **12.5–12.8 s** | **16.6 s** | **28.9 s** | 13–14GB | 1.8GB |
+| same, 11GB cap (6 trailing blocks dropped) | 13.5 s | 17.3 s | — | 16.7GB | 1.8GB |
+| same, 10GB cap (11 trailing blocks dropped) | 13.9 s | 17.6 s | — | 19.7GB | 1.8GB |
+| reference: without dropping used layers | 17.8–21.3 s | 20.5–23.5 s | 31.2 s | 24–27GB | 1.8GB |
+
+- The extra time is the disk itself (bytes read ÷ 2.3GB/s). Prefetching pages with `madvise(MADV_WILLNEED)` did not
+  help because the disk was already saturated. With a 7GB/s-class NVMe the difference shrinks to about 2 s; with a
+  SATA SSD it grows to about +25 s.
+- **Each text-encoder layer is read only once**, so its pages are dropped from the page cache right after use
+  (`madvise(MADV_PAGEOUT)`). Without this, the 13GB text encoder pushed the 10GB transformer out of the cache on every
+  pass and 24GB were re-read each time. With it, the transformer stays cached and only the 13GB of the text encoder is
+  re-read (this holds even with a 12GB cap; output unchanged).
+- **When the transformer does not fit in the cache, only the overflow is dropped**: the trailing K blocks are
+  evicted after use (`H3IMG_TRANSFORMER_DROP_BLOCKS`, default `auto`). Re-reading a fixed K blocks per step
+  (0.2GB × K × 3 steps) is far cheaper than letting the LRU evict everything and re-read it every step (24.6GB with an
+  11GB cap), so each 1GB less of RAM costs only +0.4–0.5 s. K is derived from the RAM available to the page cache
+  (cgroup limits are honored). The mmap pages of parts placed on the GPU (token refiner etc.) are dropped after
+  loading to free cache space as well.
+- The Ada numbers above are this project's first measurements on a non-Blackwell, 70W small card (x4 link). The
+  W4A8 kernels (comfy-kitchen) run on sm_89, 1.9× faster than bf16 per layer. The arithmetic differs from
+  Blackwell, so outputs are not pixel-identical across the two (mean difference ~7/255, same composition).
+- These tricks rely on `madvise` and so apply on Linux only; on Windows the OS decides what stays cached.
 
 ### Things tried and not adopted
 
