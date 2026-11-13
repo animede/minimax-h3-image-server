@@ -386,7 +386,12 @@ class Engine:
                     raise Interrupted("中断要求により生成を停止しました")
                 i = kwargs.get("pdd_step_index", 0)
                 ctx["progress"](i, steps)
-            return orig(*args, **kwargs)
+                ctx.setdefault("t_first_step", time.time())   # ここまでが text_encoder + 前処理
+            out = orig(*args, **kwargs)
+            if ctx is not None:
+                torch.cuda.synchronize(engine.device)
+                ctx["t_last_step"] = time.time()
+            return out
 
         tr.forward = forward
 
@@ -524,9 +529,15 @@ class Engine:
                 raise Interrupted("中断要求により生成を停止しました")
             out = self.pipe(**kw)
             torch.cuda.synchronize(self.device)
+            ctx = self._ctx
         finally:
             self._ctx = None
         elapsed = time.time() - t0
+        if ctx and "t_first_step" in ctx:
+            # どこに時間が掛かっているかを見るための内訳(RAM の少ない PC では text_encoder がディスク律速になる)
+            logger.info("phases: text_encoder+prep %.1fs, denoise %.1fs (%d steps), vae decode %.1fs, total %.1fs",
+                        ctx["t_first_step"] - t0, ctx["t_last_step"] - ctx["t_first_step"], steps,
+                        t0 + elapsed - ctx["t_last_step"], elapsed)
         stats = {
             "generation_seconds": round(elapsed, 2),
             "peak_vram_gb": round(torch.cuda.max_memory_allocated(self.device) / 2**30, 2),

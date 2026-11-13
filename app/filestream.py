@@ -254,7 +254,7 @@ class FileStreamer:
         for (slot, _, _), (_, master) in zip(self.layers[i], masters):
             _set(slot, master)
         if i == self.n - 1:
-            logger.debug("file streaming (%s) pass: %.2fs, %.2fs waiting for reads, %.2fs/layer read",
+            logger.info("file streaming (%s) pass: %.2fs, %.2fs waiting for reads, %.2fs/layer read",
                          self.label, time.time() - self._t0, self._wait, self._rt / max(self.n, 1))
             self._wait = self._rt = 0.0
 
