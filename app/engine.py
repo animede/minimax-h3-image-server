@@ -31,14 +31,9 @@ class Interrupted(RuntimeError):
 
 
 def _host_ram_gb() -> float:
-    """ホストの搭載メモリ(GB、/proc/meminfo の MemTotal)。読めなければ大きい値を返す(従来どおり pinned)。"""
-    try:
-        for line in open("/proc/meminfo"):
-            if line.startswith("MemTotal:"):
-                return int(line.split()[1]) / 2**20
-    except OSError:
-        pass
-    return 1e9
+    """ホストの搭載メモリ(GB)。Linux は /proc/meminfo、Windows は GlobalMemoryStatusEx。読めなければ大きい値
+    (従来どおり pinned を選ぶ)。"""
+    return pruned_image.host_memory_gb()[0]
 
 
 class _CpuEmbedding(torch.nn.Module):

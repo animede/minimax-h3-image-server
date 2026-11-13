@@ -144,6 +144,25 @@ downloading:
 
 The contents of `models/` (`te/`, `lora/`, `cache/`) may be symlinks or real directories.
 
+### Windows (untested)
+
+Windows wheels exist for all dependencies (torch 2.11+cu130, comfy-kitchen, bitsandbytes, torchao; use `triton-windows`
+for Triton). The only OS-specific code is reading RAM figures and `madvise`; on Windows the former uses Win32 APIs and
+the latter is skipped. **Not yet verified on a real Windows machine** (this note will be removed once it is).
+
+```powershell
+git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
+uv venv --python 3.12 .venv
+uv pip install --python .venv\Scripts\python.exe -r requirements-windows.txt
+.venv\Scripts\python.exe scripts\prepare_models.py --delete-te-source     # prepare the models (needs a GPU)
+.\run.ps1                                                                 # http://127.0.0.1:8633/
+```
+
+- An NVIDIA driver supporting CUDA 13 is required.
+- Windows has no `madvise`, so in the page-cache streaming (`mmap`) configurations the "drop used layers" and
+  "drop the overflow blocks" tricks do not apply; on PCs with little RAM, re-reads may be more frequent than on Linux.
+- If your torch build does not support `expandable_segments`, it only warns and continues.
+
 ### Hugging Face access
 
 The official repository is public, but some environments need `HF_TOKEN`. `scripts/prepare_models.py` uses the usual

@@ -297,18 +297,94 @@ def to_host(masters: list) -> None:
         _set(sl, pinned)
 
 
-def _make_readahead(masters: list):
-    """mmap 上の原本に対して madvise(MADV_WILLNEED) を出す関数を返す。ディスクからの読み込みを GPU の計算と
-    重ねるためのもの(ページキャッシュから流す構成では、これが無いとブロックごとにページフォールトで
-    読み込みを待つ)。失敗しても動作には影響しないので黙って無効化する。"""
+def _libc_madvise():
+    """Linux の madvise。Windows / macOS には無い(None を返し、呼び出し側は先読み・破棄を行わない)。"""
     import ctypes
-    import mmap as _mmap
+    import sys
 
+    if sys.platform != "linux":
+        return None
     try:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
         libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        return libc
+    except (OSError, AttributeError):
+        return None
+
+
+def host_memory_gb() -> tuple[float, float]:
+    """(搭載 RAM, 回収できるキャッシュ込みの空き RAM)を GB で返す。Linux は /proc/meminfo、Windows は
+    GlobalMemoryStatusEx。読めなければ (1e9, 1e9)。"""
+    import sys
+
+    if sys.platform == "win32":
+        import ctypes
+
+        class _MS(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32),
+                        ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                        ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                        ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                        ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+        ms = _MS(); ms.dwLength = ctypes.sizeof(_MS)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+            return ms.ullTotalPhys / 2**30, ms.ullAvailPhys / 2**30
+        return 1e9, 1e9
+    total = avail = 1e9
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemTotal:"):
+                total = int(line.split()[1]) / 2**20
+            elif line.startswith("MemAvailable:"):
+                avail = int(line.split()[1]) / 2**20
     except OSError:
-        return lambda i: None
+        pass
+    return total, avail
+
+
+def _process_anon_gb() -> float:
+    """このプロセスの匿名メモリ(GB)。Linux は RssAnon、Windows は PrivateUsage。"""
+    import sys
+
+    if sys.platform == "win32":
+        import ctypes
+
+        class _PMC(ctypes.Structure):
+            _fields_ = [("cb", ctypes.c_uint32), ("PageFaultCount", ctypes.c_uint32),
+                        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                        ("PrivateUsage", ctypes.c_size_t)]
+        pmc = _PMC(); pmc.cb = ctypes.sizeof(_PMC)
+        try:
+            h = ctypes.windll.kernel32.GetCurrentProcess()
+            if ctypes.windll.psapi.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+                return pmc.PrivateUsage / 2**30
+        except (AttributeError, OSError):
+            pass
+        return 0.0
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith("RssAnon:"):
+                return int(line.split()[1]) / 2**20
+    except OSError:
+        pass
+    return 0.0
+
+
+def _make_readahead(masters: list):
+    """mmap 上の原本に対して madvise(MADV_WILLNEED) を出す関数を返す。ディスクからの読み込みを GPU の計算と
+    重ねるためのもの(ページキャッシュから流す構成では、これが無いとブロックごとにページフォールトで
+    読み込みを待つ)。madvise が無い OS(Windows)では何もしない関数を返す(drop も同様)。"""
+    import ctypes
+    import mmap as _mmap
+
+    libc = _libc_madvise()
+    if libc is None:
+        noop = lambda i: None  # noqa: E731
+        noop.drop = lambda i: None
+        return noop
     page = _mmap.PAGESIZE
     ranges = []
     for entries in masters:
@@ -338,21 +414,10 @@ def host_cache_budget_gb() -> float:
     """この後ページキャッシュに使える見込みのホスト RAM(GB)。
     MemAvailable(回収できるキャッシュ込みの空き)と、cgroup の上限があれば「上限 − このプロセスの匿名メモリ」の小さい方。
     cgroup の memory.current はキャッシュ込みなので使わない(キャッシュは回収できる)。"""
-    avail = 1e9
-    anon = 0.0
+    avail = host_memory_gb()[1]
+    anon = _process_anon_gb()
     try:
-        for line in open("/proc/meminfo"):
-            if line.startswith("MemAvailable:"):
-                avail = int(line.split()[1]) / 2**20
-                break
-        for line in open("/proc/self/status"):
-            if line.startswith("RssAnon:"):
-                anon = int(line.split()[1]) / 2**20
-                break
-    except OSError:
-        pass
-    try:
-        rel = open("/proc/self/cgroup").read().strip().split(":", 2)[-1]
+        rel = open("/proc/self/cgroup").read().strip().split(":", 2)[-1]   # Linux のみ(無ければ OSError)
         node = Path("/sys/fs/cgroup" + rel)
         while True:
             mx = node / "memory.max"
@@ -369,14 +434,13 @@ def host_cache_budget_gb() -> float:
 
 
 def pageout_tensors(tensors) -> None:
-    """mmap 上のテンソルのページをページキャッシュから捨てる(GPU へコピー済みで、もう読まないもの用)。"""
+    """mmap 上のテンソルのページをページキャッシュから捨てる(GPU へコピー済みで、もう読まないもの用)。
+    madvise が無い OS では何もしない。"""
     import ctypes
     import mmap as _mmap
 
-    try:
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-    except OSError:
+    libc = _libc_madvise()
+    if libc is None:
         return
     page = _mmap.PAGESIZE
     for t in tensors:
@@ -480,6 +544,9 @@ def install_block_streaming(tr, device: torch.device, pin: bool = True, drop_blo
         k = min(max(k, 0), len(blocks))
         logger.info("transformer blocks from page cache: %.1fGB, cache budget %.1fGB -> drop %d/%d blocks after use",
                     total_gb, host_cache_budget_gb(), k, len(blocks))
+        if _libc_madvise() is None:
+            logger.warning("この OS には madvise が無いため、ページキャッシュの先読み・破棄(drop)は行えません。"
+                           "キャッシュに収まらない場合は OS の判断で読み直しが増えます")
     stream_layers(blocks, device, owner="transformer", pin=pin, drop_last=k)
 
 

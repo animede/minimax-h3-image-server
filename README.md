@@ -134,6 +134,25 @@ uv pip install --python .venv/bin/python -r requirements.txt
 
 `models/` の中身(`te/` `lora/` `cache/`)は symlink でも実体でも構いません。
 
+### Windows(未検証)
+
+依存パッケージは Windows 用の wheel がそろっています(torch 2.11+cu130、comfy-kitchen、bitsandbytes、torchao。triton は
+`triton-windows`)。コード側の OS 依存は RAM の取得と `madvise` だけで、Windows では前者を Win32 API で代替し、後者は
+行いません。**まだ実機で確認していません**(確認でき次第この注記を外します)。
+
+```powershell
+git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
+uv venv --python 3.12 .venv
+uv pip install --python .venv\Scripts\python.exe -r requirements-windows.txt
+.venv\Scripts\python.exe scripts\prepare_models.py --delete-te-source     # モデルの準備(GPU が必要)
+.\run.ps1                                                                 # http://127.0.0.1:8633/
+```
+
+- CUDA 13 系に対応した NVIDIA ドライバが必要です。
+- Windows には `madvise` が無いので、ページキャッシュから流す構成(`mmap`)での「使い終わった層を捨てる」
+  「はみ出す分だけ捨てる」は効きません。RAM の少ない PC では、Linux より読み直しが多くなる可能性があります。
+- `expandable_segments` が非対応の torch では警告が出るだけで動作します。
+
 ### Hugging Face へのアクセス
 
 本家リポジトリは公開ですが、環境によっては `HF_TOKEN` が必要です。`scripts/prepare_models.py` は
