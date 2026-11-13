@@ -26,6 +26,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import math
 import time
 from pathlib import Path
 
@@ -333,8 +334,59 @@ def _make_readahead(masters: list):
     return readahead
 
 
+def host_cache_budget_gb() -> float:
+    """この後ページキャッシュに使える見込みのホスト RAM(GB)。
+    MemAvailable(回収できるキャッシュ込みの空き)と、cgroup の上限があれば「上限 − このプロセスの匿名メモリ」の小さい方。
+    cgroup の memory.current はキャッシュ込みなので使わない(キャッシュは回収できる)。"""
+    avail = 1e9
+    anon = 0.0
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                avail = int(line.split()[1]) / 2**20
+                break
+        for line in open("/proc/self/status"):
+            if line.startswith("RssAnon:"):
+                anon = int(line.split()[1]) / 2**20
+                break
+    except OSError:
+        pass
+    try:
+        rel = open("/proc/self/cgroup").read().strip().split(":", 2)[-1]
+        node = Path("/sys/fs/cgroup" + rel)
+        while True:
+            mx = node / "memory.max"
+            if mx.exists():
+                v = mx.read_text().strip()
+                if v != "max":
+                    avail = min(avail, int(v) / 2**30 - anon)
+            if node == Path("/sys/fs/cgroup") or node == node.parent:
+                break
+            node = node.parent
+    except (OSError, ValueError):
+        pass
+    return avail
+
+
+def pageout_tensors(tensors) -> None:
+    """mmap 上のテンソルのページをページキャッシュから捨てる(GPU へコピー済みで、もう読まないもの用)。"""
+    import ctypes
+    import mmap as _mmap
+
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    except OSError:
+        return
+    page = _mmap.PAGESIZE
+    for t in tensors:
+        addr, nb = t.data_ptr(), t.numel() * t.element_size()
+        start = addr - addr % page
+        libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(addr + nb - start), 21)   # MADV_PAGEOUT
+
+
 def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = True, pin: bool = True,
-                  drop_after_use: bool = False) -> None:
+                  drop_after_use: bool = False, drop_last: int = 0) -> None:
     """layers(順に呼ばれる層の列)をピン留めした原本に置き、forward hook で 1 つずつ GPU へ流す。
     層 i の計算中に i+1 を別 stream で先読みする。
 
@@ -350,6 +402,9 @@ def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = Tru
     n = len(masters)
     readahead = (lambda i: None) if pin else _make_readahead(masters)
     drop_after_use = drop_after_use and not pin
+    # drop_last: 末尾 K 層は使い終わったらページを捨てる(mmap で原本がキャッシュに収まりきらないとき、
+    # 全部が LRU で押し出されるより、決まった K 層だけを読み直す方が安い)
+    drop_last = min(max(int(drop_last), 0), len(masters)) if not pin else 0
     if not prefetch:
         # 先読みなし: 計算と同じ stream でコピーする。解放はストリーム順序で守られるので record_stream が要らず、
         # アロケータの予約が膨らまない(1 回しか通らない TE 向け)。mmap のときはディスクの先読みだけ出す。
@@ -392,8 +447,12 @@ def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = Tru
         return pre
 
     def make_post(i: int):
+        sacrificial = i >= n - drop_last
+
         def post(mod, args, out):
             to_host(masters[i])
+            if sacrificial:
+                readahead.drop(i)
         return post
 
     for i, layer in enumerate(layers):
@@ -401,10 +460,27 @@ def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = Tru
         layer.register_forward_hook(make_post(i))
 
 
-def install_block_streaming(tr, device: torch.device, pin: bool = True) -> None:
+def install_block_streaming(tr, device: torch.device, pin: bool = True, drop_blocks: str = "auto") -> None:
     """transformer_blocks(50 個、ck-w4a8 で各 ~0.2GB)を先読みしながら流す(8gb 構成)。
-    pin=False なら原本は量子化キャッシュの mmap(ページキャッシュ)のまま(RAM の少ない PC 向け)。"""
-    stream_layers(tr.transformer_blocks, device, owner="transformer", pin=pin)
+    pin=False なら原本は量子化キャッシュの mmap(ページキャッシュ)のまま(RAM の少ない PC 向け)。
+
+    drop_blocks: mmap のとき、使い終わったらページを捨てる末尾ブロック数。"auto" はページキャッシュに使える RAM
+    (cgroup の上限も見る)と原本の大きさから、はみ出す分だけを捨てる(残りは毎ステップ読み直さずに済む)。"""
+    blocks = tr.transformer_blocks
+    k = 0
+    if not pin:
+        total_gb = sum(_get(sl).numel() * _get(sl).element_size() for b in blocks for sl in _slots(b)) / 2**30
+        per_block = total_gb / len(blocks)
+        if drop_blocks == "auto":
+            margin = 0.5   # TE の通過中の層・埋め込み表の参照ページなど、キャッシュを共有するものの分
+            avail = host_cache_budget_gb()
+            k = int(math.ceil(max(0.0, total_gb + margin - avail) / per_block))
+        else:
+            k = int(drop_blocks)
+        k = min(max(k, 0), len(blocks))
+        logger.info("transformer blocks from page cache: %.1fGB, cache budget %.1fGB -> drop %d/%d blocks after use",
+                    total_gb, host_cache_budget_gb(), k, len(blocks))
+    stream_layers(blocks, device, owner="transformer", pin=pin, drop_last=k)
 
 
 def _replace_quant_targets_with_ck_shells(tr) -> None:
@@ -434,7 +510,7 @@ def load_lora_pairs(lora_path: str) -> tuple[dict[str, tuple[torch.Tensor, torch
 
 def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: bool = True,
                 quant: str = "int8wo", lora_path: str | None = None, stream_blocks: bool = False,
-                pin_blocks: bool = True):
+                pin_blocks: bool = True, drop_blocks: str = "auto"):
     """bf16 シャードから量子化済み transformer を組み立てる(1 テンソルずつ GPU へ)。
 
     quant="int8wo": torchao Int8WeightOnly(キャッシュ可。eager では bf16 へ逆量子化してから
@@ -530,7 +606,7 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
             mod_name, _, attr = name.rpartition(".")
             dict(tr.named_modules())[mod_name].register_buffer(attr, buf.to(device), persistent=False)
     if stream_blocks:
-        install_block_streaming(tr, device, pin=pin_blocks)
+        install_block_streaming(tr, device, pin=pin_blocks, drop_blocks=drop_blocks)
     torch.cuda.empty_cache()
     install_forward_wrapper(tr)
     tr.eval()
@@ -556,7 +632,8 @@ def save_cache(tr, cache_dir: Path) -> None:
     logger.info("cache saved: %s (%.1fGiB)", cache_dir, size)
 
 
-def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = False, pin_blocks: bool = True):
+def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = False, pin_blocks: bool = True,
+               drop_blocks: str = "auto"):
     from accelerate import init_empty_weights
     from diffusers import MiniMaxH3ImageTransformer2DModel as Cls
 
@@ -575,10 +652,14 @@ def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = Fals
     # 量子化済み Linear は meta の nn.Parameter(bf16)に Int8Tensor を assign で差し替える。
     tr.load_state_dict(sd, assign=True)
     if stream_blocks:
+        others = []
         for name, child in tr.named_children():
             if name != "transformer_blocks":
+                others += [_get(sl) for sl in _slots(child)]   # GPU へ移す前の mmap 上のテンソル
                 child.to(device)
-        install_block_streaming(tr, device, pin=pin_blocks)
+        if not pin_blocks:
+            pageout_tensors(others)   # GPU に置いた分のページはもう読まない。キャッシュの枠をブロックに譲る
+        install_block_streaming(tr, device, pin=pin_blocks, drop_blocks=drop_blocks)
     else:
         tr = tr.to(device)
     install_forward_wrapper(tr)
@@ -589,22 +670,23 @@ def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = Fals
 
 
 def load_transformer(repo: str, pipe, device: torch.device, cache_dir: Path, quant: str = "int8wo",
-                     lora_path: str | None = None, stream_blocks: bool = False, pin_blocks: bool = True):
+                     lora_path: str | None = None, stream_blocks: bool = False, pin_blocks: bool = True,
+                     drop_blocks: str = "auto"):
     """キャッシュがあれば読む、無ければ構築して保存する(bnb-int8 は毎回構築)。"""
     keys = timestep_keys(pipe)
     logger.info("AdaLN timestep keys: %s", keys.tolist())
     if quant == "bnb-int8":
         return build_fresh(repo, device, keys, verify=True, quant=quant, lora_path=lora_path,
-                           stream_blocks=stream_blocks, pin_blocks=pin_blocks)
+                           stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks)
     if (cache_dir / STATE_FILENAME).exists():
-        tr = load_cache(cache_dir, device, stream_blocks=stream_blocks, pin_blocks=pin_blocks)
+        tr = load_cache(cache_dir, device, stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks)
         cached = next(m for m in tr.modules() if isinstance(m, AdaLNTable)).keys.cpu()
         if not torch.equal(cached, keys):
             raise RuntimeError(f"キャッシュの時刻集合 {cached.tolist()} が現在の {keys.tolist()} と異なります。"
                                f"{cache_dir} を削除して作り直してください")
         return tr
     tr = build_fresh(repo, device, keys, verify=True, quant=quant, lora_path=lora_path,
-                     stream_blocks=stream_blocks, pin_blocks=pin_blocks)
+                     stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks)
     save_cache(tr, cache_dir)
     return tr
 

@@ -296,6 +296,7 @@ system prompt とし、さらに上記 skill のガイド本文(`references/t2i-
 | `H3IMG_VRAM_RESERVE_GB` | 1.0 | 予算から差し引いて必ず空けておく VRAM(画面表示・他のアプリ用) |
 | `H3IMG_TE_HOST` | auto | text_encoder の原本: `pinned`(速い、RAM 約 13GB)/ `mmap`(ページキャッシュ、RAM の少ない PC 向け)。auto は搭載 48GB 以上で pinned |
 | `H3IMG_TRANSFORMER_HOST` | auto | transformer ブロックの原本(8gb 構成): `pinned`(RAM 約 10GB)/ `mmap`(量子化キャッシュのページキャッシュから流す。RAM 16GB の PC 向け、毎生成でディスクから読み直す)。auto は TE と同じ規則 |
+| `H3IMG_TRANSFORMER_DROP_BLOCKS` | auto | `mmap` のとき使い終わったらページを捨てる末尾ブロック数。auto = キャッシュに使える RAM からはみ出す分だけ。0 で捨てない |
 | `H3IMG_GENERATION_AREA` | requested | 既定キャンバス(`native` = 最低 4MP) |
 | `H3IMG_PRELOAD` | 0 | 1 で起動時にロード |
 | `H3IMG_MODELS_DIR` | `./models` | te / lora / cache の置き場 |
@@ -505,8 +506,10 @@ NVMe は Gen4 で連続読み 2.3GB/s、予備 1GB、出力は pinned 構成と�
 | 構成 | 1024² | 2048² | 編集 1664×2496 | 1 枚あたりのディスク読み込み | 必須 RAM |
 |---|---|---|---|---|---|
 | pinned(RAM 制限なし、同じ Ada カード) | 8.2s | 12.7s | 24.3s | 0 | 27GB |
-| mmap × mmap、RAM 12GB 上限(TE の層を使い終わったら捨てる、現行) | **12.5s** | **16.6s** | **28.9s** | 13GB | 1.8GB |
-| 同上、捨てない場合(参考) | 17.8s | 20.5s | 31.2s | 24〜25GB | 1.8GB |
+| mmap × mmap、RAM 12GB 上限(現行) | **12.5〜12.8s** | **16.6s** | **28.9s** | 13〜14GB | 1.8GB |
+| 同上、RAM 11GB 上限(末尾 6 ブロックを捨てる) | 13.5s | 17.3s | — | 16.7GB | 1.8GB |
+| 同上、RAM 10GB 上限(末尾 11 ブロックを捨てる) | 13.9s | 17.6s | — | 19.7GB | 1.8GB |
+| 参考: 使い終わった層を捨てない場合 | 17.8〜21.3s | 20.5〜23.5s | 31.2s | 24〜27GB | 1.8GB |
 
 - 遅くなる分はディスクの速度そのものです(読み込み量 ÷ 2.3GB/s)。`madvise(MADV_WILLNEED)` による先読みは、
   ディスクが既に限界なので効きませんでした。連続読み 7GB/s 級の NVMe なら差は 2 秒程度に縮む計算です。SATA SSD では
@@ -515,6 +518,11 @@ NVMe は Gen4 で連続読み 2.3GB/s、予備 1GB、出力は pinned 構成と�
   (`madvise(MADV_PAGEOUT)`)。これを入れないと、13GB の TE が通過するたびに transformer 10GB のページが押し出され、
   毎回 24GB を読み直していました。捨てるようにすると transformer はキャッシュに残り、読み直しは TE の 13GB だけになります
   (RAM 12GB 上限でも成立。出力は不変)。
+- **transformer がキャッシュに収まりきらないときは、はみ出す分の末尾ブロックだけを使い終わったら捨てます**
+  (`H3IMG_TRANSFORMER_DROP_BLOCKS`、既定 `auto`)。全部が LRU で押し出されて毎ステップ読み直す(RAM 11GB 上限で 24.6GB)
+  より、決まった K ブロックを毎ステップ読み直す(0.2GB × K × 3 step)方がずっと安く、上限が 1GB 下がるごとに
+  +0.4〜0.5 秒ずつ緩やかに遅くなります。K はページキャッシュに使える RAM(cgroup の上限も見る)から自動で決めます。
+  GPU に置いた部品(token refiner など)の mmap ページも、ロード後に捨ててキャッシュの枠を空けます。
 - 上の Ada の数値は、このプロジェクトで初めての Blackwell 以外・70W の小型カードでの実測です(x4 接続)。W4A8 カーネル
   (comfy-kitchen)は sm_89 でも動き、単層で bf16 の 1.9 倍速でした。Blackwell とは数値が異なるので出力はピクセル一致
   しません(平均差 7/255 程度、構図は同じ)。

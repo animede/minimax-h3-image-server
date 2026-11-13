@@ -71,6 +71,9 @@ class Settings:
     # transformer ブロックをストリーミングするときの原本の置き場所: pinned / mmap(量子化キャッシュのページキャッシュから
     # 直接流す。必須 RAM が約 10GB 減るが、毎生成でディスクから読み直す)/ auto(既定 = te_host と同じ規則)
     transformer_host: str = _env("H3IMG_TRANSFORMER_HOST", "auto")
+    # transformer_host=mmap のとき、使い終わったらページを捨てる末尾ブロック数。auto = ページキャッシュに使える RAM から
+    # はみ出す分だけ(全部が押し出されて毎ステップ読み直すのを避ける)。0 で捨てない
+    transformer_drop_blocks: str = _env("H3IMG_TRANSFORMER_DROP_BLOCKS", "auto")
     # 以下 3 つは auto(既定)なら VRAM 予算から決まる。明示すると予算より優先する。
     # transformer の量子化: int8wo(torchao、19GiB)/ ck-w4a8(comfy-kitchen W4A8、約 11GiB)
     transformer_quant: str = _env("H3IMG_TRANSFORMER_QUANT", "auto")

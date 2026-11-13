@@ -364,7 +364,8 @@ class Engine:
         stream = self._transformer_stream_enabled()
         tr = pruned_image.load_transformer(self._resolve_repo(), self.pipe, self.device,
                                            self.s.cache_dir / cache_name, quant=quant, lora_path=lora,
-                                           stream_blocks=stream, pin_blocks=self.transformer_host != "mmap")
+                                           stream_blocks=stream, pin_blocks=self.transformer_host != "mmap",
+                                           drop_blocks=self.s.transformer_drop_blocks)
         self.transformer_streamed = stream
         self._install_progress_hook(tr, steps)
         logger.info("transformer (steps=%d) ready in %.1fs, alloc=%.2fGB", steps, time.time() - t0,
