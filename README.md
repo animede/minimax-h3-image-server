@@ -52,11 +52,11 @@ diffusers(main)ベース、コードは MIT ライセンス。
 |---|---|---|---|---|
 | `48gb` | int8wo、TE 常駐(最高速) | ≥ 38.7GB(TE が別 GPU なら ≥ 21.7GB) | 37〜38.4GB | 2GB |
 | `32gb` | W4A8、TE 常駐 | ≥ 30.5GB(別 GPU なら ≥ 13.6GB) | 28.7〜30.2GB | 2.5GB |
-| `16gb` | W4A8 + TE 層ストリーミング + VAE スワップ | ≥ 13.3GB | 12.5〜13.0GB | 18.3GB(`mmap` なら 3.5GB) |
-| `8gb` | 上記 + transformer ブロックストリーミング | それ未満 | 2.4〜2.9GB(VAE を GPU に置くと +1.4GB) | 27.2GB(`mmap` なら 12.4GB) |
+| `16gb` | W4A8 + TE 層ストリーミング + VAE スワップ | ≥ 13.3GB | 12.5〜13.0GB | 18.3GB(`file` なら 3.5GB) |
+| `8gb` | 上記 + transformer ブロックストリーミング | それ未満 | 2.4〜2.9GB(VAE を GPU に置くと +1.4GB) | 27.2GB(`file` なら 12.4GB、transformer も `file` なら 2.3GB) |
 
-ホスト RAM の `mmap` は text_encoder の原本をページキャッシュに置く設定で、搭載 RAM 48GB 未満の PC では既定で
-選ばれます([下記](#vram-の予備とram-の少ない-pc-向けの設定))。
+ホスト RAM の `file` は text_encoder の原本をピン留めせず、層ごとにファイルから直接読んで流す設定で、搭載 RAM 48GB
+未満の PC では既定で選ばれます([下記](#vram-の予備とram-の少ない-pc-向けの設定))。
 
 - GPU が 2 枚あれば TE は既定で 2 枚目に置きます(`H3IMG_TE_GPU`)。使う GPU は `H3IMG_GPU=1` のように番号で指定。
 - 生成中に CUDA OOM が起きたら(ロード後に他のプロセスが VRAM を取った等)、**一段下のプロファイルへ自動で下げて
@@ -168,8 +168,10 @@ py -3.12 -m venv .venv                      # py が無ければ python -m venv 
 ```
 
 - CUDA 13 系に対応した NVIDIA ドライバが必要です。
-- Windows には `madvise` が無いので、ページキャッシュから流す構成(`mmap`)での「使い終わった層を捨てる」
-  「はみ出す分だけ捨てる」は効きません。RAM の少ない PC では、Linux より読み直しが多くなる可能性があります。
+- RAM の少ない PC 向けの原本の置き場所は、Linux / Windows とも既定で `file`(ファイルから直接読む)です。
+  `mmap`(ページキャッシュ + `madvise`)は Linux 専用で、Windows では使い終わった層の破棄が効きません。
+- PowerShell で `.\run.ps1` がスクリプトの実行ポリシーで止まる場合は
+  `powershell -ExecutionPolicy Bypass -File .\run.ps1` で起動してください。
 - `expandable_segments` が非対応の torch では警告が出るだけで動作します。
 
 ### Hugging Face へのアクセス
@@ -204,7 +206,7 @@ H3IMG_GPU=0 H3IMG_TE_GPU=1 ./run.sh
 # 予算を指定: 96GB の GPU でも 16GB 級の構成(W4A8 + TE ストリーミング)で動かす
 H3IMG_VRAM_GB=16 ./run.sh
 
-# 8GB 級の構成を強制(必須のホスト RAM は約 27GB、RAM 48GB 未満の PC では自動で mmap になり約 12GB)
+# 8GB 級の構成を強制(必須のホスト RAM は約 27GB、RAM 48GB 未満の PC では自動で file になり約 2GB + キャッシュ)
 H3IMG_VRAM_GB=8 ./run.sh
 
 # 量子化だけ明示(予算より優先): W4A8 で TE は常駐(32GB 級の構成)
@@ -223,8 +225,8 @@ H3IMG_VRAM_FALLBACK=0 ./run.sh
 | `H3IMG_TRANSFORMER_STREAM` | `auto` / `0` / `1` | transformer のブロックストリーミング(常駐 11GB → 1GB) |
 | `H3IMG_VRAM_FALLBACK` | `1` / `0` | 生成中の OOM で一段下のプロファイルへ自動で下げる |
 | `H3IMG_VRAM_RESERVE_GB` | 数値(既定 1.0) | 必ず空けておく VRAM(画面表示などの分) |
-| `H3IMG_TE_HOST` | `auto` / `pinned` / `mmap` | text_encoder の原本の置き場所(mmap は RAM 32GB の PC 向け) |
-| `H3IMG_TRANSFORMER_HOST` | `auto` / `pinned` / `mmap` | transformer ブロックの原本の置き場所(mmap は RAM 16GB の PC 向け、ディスク速度に依存) |
+| `H3IMG_TE_HOST` | `auto` / `pinned` / `file` / `mmap` | text_encoder の原本の置き場所(file は RAM 32GB 以下の PC 向け) |
+| `H3IMG_TRANSFORMER_HOST` | `auto` / `pinned` / `file` / `mmap` | transformer ブロックの原本の置き場所(file は RAM 16GB の PC 向け、ディスク速度に依存) |
 
 | プロファイル | 量子化 | TE | transformer | 要る予算 | 速度(1024² / 2048²、TE は pinned) |
 |---|---|---|---|---|---|
@@ -332,9 +334,9 @@ system prompt とし、さらに上記 skill のガイド本文(`references/t2i-
 | `H3IMG_VRAM_GB` | auto | VRAM 予算(GB)。auto = GPU の総容量。実際の空きと小さい方で 48gb / 32gb / 16gb / 8gb プロファイルを選ぶ |
 | `H3IMG_VRAM_FALLBACK` | 1 | 生成中の CUDA OOM で一段下のプロファイルへ自動で下げてやり直す |
 | `H3IMG_VRAM_RESERVE_GB` | 1.0 | 予算から差し引いて必ず空けておく VRAM(画面表示・他のアプリ用) |
-| `H3IMG_TE_HOST` | auto | text_encoder の原本: `pinned`(速い、RAM 約 13GB)/ `mmap`(ページキャッシュ、RAM の少ない PC 向け)。auto は搭載 48GB 以上で pinned |
-| `H3IMG_TRANSFORMER_HOST` | auto | transformer ブロックの原本(8gb 構成): `pinned`(RAM 約 10GB)/ `mmap`(量子化キャッシュのページキャッシュから流す。RAM 16GB の PC 向け、毎生成でディスクから読み直す)。auto は TE と同じ規則 |
-| `H3IMG_TRANSFORMER_DROP_BLOCKS` | auto | `mmap` のとき使い終わったらページを捨てる末尾ブロック数。auto = キャッシュに使える RAM からはみ出す分だけ。0 で捨てない |
+| `H3IMG_TE_HOST` | auto | text_encoder の原本: `pinned`(速い、RAM 約 13GB)/ `file`(層ごとにファイルから直接読む。RAM の少ない PC 向け、OS を問わない)/ `mmap`(ページキャッシュ + madvise、Linux のみ)。auto は搭載 48GB 以上で pinned、未満で file |
+| `H3IMG_TRANSFORMER_HOST` | auto | transformer ブロックの原本(8gb 構成): `pinned`(RAM 約 10GB)/ `file`・`mmap`(量子化キャッシュのページキャッシュから流し、収まらない分は読み直す。RAM 16GB の PC 向け)。auto は TE と同じ規則 |
+| `H3IMG_TRANSFORMER_DROP_BLOCKS` | auto | `file` / `mmap` のとき、使い終わったら捨てる(file なら直接読む)末尾ブロック数。auto = キャッシュに使える RAM からはみ出す分だけ。0 で捨てない |
 | `H3IMG_GENERATION_AREA` | requested | 既定キャンバス(`native` = 最低 4MP) |
 | `H3IMG_PRELOAD` | 0 | 1 で起動時にロード |
 | `H3IMG_MODELS_DIR` | `./models` | te / lora / cache の置き場 |
@@ -373,7 +375,7 @@ VRAM を減らす手段は「小さくする」「GPU に置かない」「使�
 
 どの手段をどこまで使うかは VRAM 予算([起動例](#起動例gpuvram-予算量子化の指定))から自動で決めます。
 「置かない / 使う瞬間だけ置く」ものはホスト RAM に残るので、8GB 構成ではプロセスのホスト RAM 使用量が約 29GB になります
-(text_encoder をページキャッシュに置く `mmap` 設定なら必須分は約 12GB)。
+(text_encoder をファイルから直接読む `file` 設定なら必須分は約 12GB、transformer も `file` なら約 2GB)。
 
 ### 1. AdaLN 射影を「事前計算テーブル」に置き換える(VRAM −26GB、誤差ゼロ)
 
@@ -517,9 +519,13 @@ GPU から外したものはホスト RAM に置きます。最初の実装は 8
 **text_encoder の原本の置き場所(`H3IMG_TE_HOST`)**:
 
 - `pinned`: ピン留めしたホスト RAM(約 13GB を常に使う)。速い。
-- `mmap`: safetensors ファイルのページキャッシュから直接流す。ページキャッシュは OS がいつでも回収できる
-  メモリなので、**必須のホスト RAM が約 13GB 減ります**。代わりにピン留めしない分、生成が 0.7〜0.9 秒遅くなります。
-- `auto`(既定): 搭載 RAM が 48GB 以上なら `pinned`、未満なら `mmap`。
+- `file`: 層ごとに safetensors ファイルから直接、ピン留めした小さな受け皿(2 × 0.26GB)へ 8 スレッドで並列に読み、
+  GPU へ流す。ページキャッシュを経由しない(Linux は読んだ範囲を `fadvise(DONTNEED)` で捨て、Windows は
+  `FILE_FLAG_SEQUENTIAL_SCAN`)ので **必須のホスト RAM が約 13GB 減り**、他のキャッシュも押し出しません。
+  OS を問わず動きます。速度はディスク次第(Gen4 NVMe で TE 13GB の通過が 4 秒)。
+- `mmap`: safetensors ファイルのページキャッシュから直接流す(Linux 専用、`madvise` で使い終わった層を捨てる)。
+  `file` より遅い(下記)ので、比較用に残してあります。
+- `auto`(既定): 搭載 RAM が 48GB 以上なら `pinned`、未満なら `file`。
 
 8GB / 16GB のカードを模擬した実測(GPU の空きを 7.3GB / 15.5GB に制限、予備 1GB。出力はすべて同一):
 
@@ -530,13 +536,14 @@ GPU から外したものはホスト RAM に置きます。最初の実装は 8
 | 16GB | mmap | 14.1GB | 1.7GB | **3.5GB**(+ ページキャッシュ 14GB) | 2.2s | 4.4s | 7.2s |
 | 16GB | pinned | 14.1GB | 1.7GB | 18.3GB | 1.3s | 3.5s | 6.2s |
 
-**RAM 32GB の PC では `mmap`(既定で自動選択)**、48GB 以上なら `pinned` で速くなります。
+上の表の `mmap` 行は、現在の既定 `file` でも同じ必須 RAM で、速度は `mmap` より速くなります(下記)。
+**RAM 32GB の PC では `file`(既定で自動選択)**、48GB 以上なら `pinned` で速くなります。
 
-### RAM 16GB・GPU 6GB の PC(transformer もページキャッシュから流す)
+### RAM 16GB・GPU 6GB の PC(transformer もファイル / ページキャッシュから流す)
 
-`H3IMG_TRANSFORMER_HOST=mmap` にすると、transformer の 50 ブロックも量子化キャッシュのページキャッシュから直接流し、
-必須のホスト RAM は **約 1.8GB**(プロセスの匿名メモリ)まで下がります。代わりに、RAM に収まらない分は
-**生成のたびにディスクから読み直す**ので、速度はディスクの連続読み出し速度で決まります。
+`H3IMG_TRANSFORMER_HOST=file`(RAM 48GB 未満の既定)にすると、transformer の 50 ブロックも量子化キャッシュ
+(safetensors)のページキャッシュから直接流し、必須のホスト RAM は **約 2GB**(プロセスの匿名メモリ)まで下がります。
+代わりに、RAM に収まらない分は**生成のたびにディスクから読み直す**ので、速度はディスクの連続読み出し速度で決まります。
 
 実測(RTX 4000 SFF Ada 20GB の空きを 6GB に制限、プロセスのメモリ上限 12GB = RAM 16GB の PC 相当、
 NVMe は Gen4 で連続読み 2.3GB/s、予備 1GB、出力は pinned 構成とピクセル一致):
@@ -544,23 +551,34 @@ NVMe は Gen4 で連続読み 2.3GB/s、予備 1GB、出力は pinned 構成と�
 | 構成 | 1024² | 2048² | 編集 1664×2496 | 1 枚あたりのディスク読み込み | 必須 RAM |
 |---|---|---|---|---|---|
 | pinned(RAM 制限なし、同じ Ada カード) | 8.2s | 12.7s | 24.3s | 0 | 27GB |
-| mmap × mmap、RAM 12GB 上限(現行) | **12.5〜12.8s** | **16.6s** | **28.9s** | 13〜14GB | 1.8GB |
+| **file × file、RAM 12GB 上限(現行既定、末尾 5 ブロックを直接読む)** | **10.5s** | **14.4s** | — | 16GB | 2.3GB |
+| 同上、RAM 11GB 上限(末尾 10 ブロック) | 10.6s | 14.5s | — | 19GB | 2.3GB |
+| 同上、RAM 10GB 上限(末尾 15 ブロック) | 11.1s | 14.5s | — | 22GB | 2.3GB |
+| mmap × mmap、RAM 12GB 上限(Linux 専用の旧既定) | 12.5〜12.8s | 16.6s | 28.9s | 13〜14GB | 1.8GB |
 | 同上、RAM 11GB 上限(末尾 6 ブロックを捨てる) | 13.5s | 17.3s | — | 16.7GB | 1.8GB |
 | 同上、RAM 10GB 上限(末尾 11 ブロックを捨てる) | 13.9s | 17.6s | — | 19.7GB | 1.8GB |
-| 参考: 使い終わった層を捨てない場合 | 17.8〜21.3s | 20.5〜23.5s | 31.2s | 24〜27GB | 1.8GB |
+| 参考: 使い終わった層を捨てない場合(mmap) | 17.8〜21.3s | 20.5〜23.5s | 31.2s | 24〜27GB | 1.8GB |
 
-- 遅くなる分はディスクの速度そのものです(読み込み量 ÷ 2.3GB/s)。`madvise(MADV_WILLNEED)` による先読みは、
-  ディスクが既に限界なので効きませんでした。連続読み 7GB/s 級の NVMe なら差は 2 秒程度に縮む計算です。SATA SSD では
-  +25 秒前後になります。
-- **text_encoder の層は 1 回しか読まない**ので、使い終わった層のページをその場でページキャッシュから捨てます
-  (`madvise(MADV_PAGEOUT)`)。これを入れないと、13GB の TE が通過するたびに transformer 10GB のページが押し出され、
-  毎回 24GB を読み直していました。捨てるようにすると transformer はキャッシュに残り、読み直しは TE の 13GB だけになります
-  (RAM 12GB 上限でも成立。出力は不変)。
+- `file` が `mmap` より速いのは読み方の違いです。ページキャッシュ経由(mmap のページフォールト、または 1 スレッドの
+  `read`)は 1.6GB/s 止まりでしたが、層のテンソル全部を 32MB ずつ 8 スレッドで同時に読むと同じ NVMe で 4GB/s 出ます
+  (TE 13GB の通過が 8.4 秒 → 4.0 秒)。読む量は `mmap` より少し多い(末尾ブロックの分)のに、合計では速くなります。
+  SATA SSD では読み込み量 ÷ 0.5GB/s で +30 秒前後になります。
+- `file` の受け皿(staging)は `pin_memory()`(cudaHostAlloc)ではなく、普通のメモリを `cudaHostRegister` でピン留め
+  します。前者は cgroup に "file" として計上され、ページキャッシュの予算計算(匿名メモリを差し引く)から漏れて
+  transformer を押し出していました(実測で読み直しが 28GB に増えた)。
+- **text_encoder の層は 1 回しか読まない**ので、ページキャッシュに残しません(`file` は読んだ範囲を `fadvise` で捨て、
+  `mmap` は `madvise(MADV_PAGEOUT)`)。これを入れないと、13GB の TE が通過するたびに transformer 10GB のページが
+  押し出され、毎回 24GB を読み直していました。捨てるようにすると transformer はキャッシュに残り、読み直しは TE の 13GB
+  だけになります(RAM 12GB 上限でも成立。出力は不変)。
 - **transformer がキャッシュに収まりきらないときは、はみ出す分の末尾ブロックだけを使い終わったら捨てます**
   (`H3IMG_TRANSFORMER_DROP_BLOCKS`、既定 `auto`)。全部が LRU で押し出されて毎ステップ読み直す(RAM 11GB 上限で 24.6GB)
   より、決まった K ブロックを毎ステップ読み直す(0.2GB × K × 3 step)方がずっと安く、上限が 1GB 下がるごとに
-  +0.4〜0.5 秒ずつ緩やかに遅くなります。K はページキャッシュに使える RAM(cgroup の上限も見る)から自動で決めます。
-  GPU に置いた部品(token refiner など)の mmap ページも、ロード後に捨ててキャッシュの枠を空けます。
+  +0.3〜0.5 秒ずつ緩やかに遅くなります。K はページキャッシュに使える RAM(cgroup の上限も見る)から自動で決めます。
+  `file` では K ブロックをファイルから直接読み(残りはページキャッシュの mmap)、`mmap` では使い終わったら捨てます。
+  GPU に置いた部品(token refiner など)の mmap ページも、ロード後に捨ててキャッシュの枠を空けます(Linux)。
+- テンソルのファイル内位置は safetensors のヘッダから求めます。mmap で読んだテンソルは「アドレス − マッピングの先頭」が
+  ファイル内オフセットなので、名前に頼らず逆算できます。W4A8 の量子化キャッシュはこのため safetensors で保存します
+  (以前の `.pt` は初回ロード時に自動で変換します)。
 - 上の Ada の数値は、このプロジェクトで初めての Blackwell 以外・70W の小型カードでの実測です(x4 接続)。W4A8 カーネル
   (comfy-kitchen)は sm_89 でも動き、単層で bf16 の 1.9 倍速でした。Blackwell とは数値が異なるので出力はピクセル一致
   しません(平均差 7/255 程度、構図は同じ)。

@@ -66,12 +66,15 @@ class Settings:
     vram_reserve_gb: float = float(_env("H3IMG_VRAM_RESERVE_GB", "1.0"))
     # text_encoder をストリーミングするときの原本の置き場所: pinned(ピン留めしたホスト RAM、約 13GB を常に使う)/
     # mmap(safetensors ファイルのページキャッシュから直接流す。OS が回収できるメモリなので RAM の少ない PC 向け。
-    # ピン留めしない分、生成が 0.7〜0.9 秒遅い)/ auto(既定。ホスト RAM 48GB 以上なら pinned、未満なら mmap)
+    # ピン留めしない分、生成が 0.7〜0.9 秒遅い。Linux のみ)/ file(ページキャッシュを経由せず、層ごとにファイルから
+    # 直接ピン留めバッファへ並列読みして流す。OS を問わず動き mmap より速い)/ auto(既定。ホスト RAM 48GB 以上なら
+    # pinned、未満なら file)
     te_host: str = _env("H3IMG_TE_HOST", "auto")
     # transformer ブロックをストリーミングするときの原本の置き場所: pinned / mmap(量子化キャッシュのページキャッシュから
-    # 直接流す。必須 RAM が約 10GB 減るが、毎生成でディスクから読み直す)/ auto(既定 = te_host と同じ規則)
+    # 直接流す。必須 RAM が約 10GB 減るが、毎生成でディスクから読み直す。Linux のみ)/ file(mmap と同じだが、
+    # キャッシュからはみ出す末尾ブロックをファイルから直接読む。OS を問わない)/ auto(既定 = te_host と同じ規則)
     transformer_host: str = _env("H3IMG_TRANSFORMER_HOST", "auto")
-    # transformer_host=mmap のとき、使い終わったらページを捨てる末尾ブロック数。auto = ページキャッシュに使える RAM から
+    # transformer_host=mmap/file のとき、使い終わったらページを捨てる(file なら直接読む)末尾ブロック数。auto = ページキャッシュに使える RAM から
     # はみ出す分だけ(全部が押し出されて毎ステップ読み直すのを避ける)。0 で捨てない
     transformer_drop_blocks: str = _env("H3IMG_TRANSFORMER_DROP_BLOCKS", "auto")
     # 以下 3 つは auto(既定)なら VRAM 予算から決まる。明示すると予算より優先する。
@@ -118,10 +121,10 @@ class Settings:
                 float(self.vram_gb)
             except ValueError:
                 raise ValueError("H3IMG_VRAM_GB は auto か数値(GB)です") from None
-        if self.te_host not in ("auto", "pinned", "mmap"):
-            raise ValueError("H3IMG_TE_HOST は auto / pinned / mmap のいずれかです")
-        if self.transformer_host not in ("auto", "pinned", "mmap"):
-            raise ValueError("H3IMG_TRANSFORMER_HOST は auto / pinned / mmap のいずれかです")
+        if self.te_host not in ("auto", "pinned", "mmap", "file"):
+            raise ValueError("H3IMG_TE_HOST は auto / pinned / mmap / file のいずれかです")
+        if self.transformer_host not in ("auto", "pinned", "mmap", "file"):
+            raise ValueError("H3IMG_TRANSFORMER_HOST は auto / pinned / mmap / file のいずれかです")
         if self.te_stream not in ("auto", "0", "1"):
             raise ValueError("H3IMG_TE_STREAM は auto / 0 / 1 のいずれかです")
         if self.transformer_stream not in ("auto", "0", "1"):

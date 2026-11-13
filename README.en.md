@@ -57,10 +57,10 @@ startup runs the 16GB-class configuration even on a large GPU.
 |---|---|---|---|---|
 | `48gb` | int8wo, TE resident (fastest) | ≥ 38.7GB (≥ 21.7GB if the TE is on another GPU) | 37–38.4GB | 2GB |
 | `32gb` | W4A8, TE resident | ≥ 30.5GB (≥ 13.6GB with a separate TE GPU) | 28.7–30.2GB | 2.5GB |
-| `16gb` | W4A8 + TE layer streaming + VAE swap | ≥ 13.3GB | 12.5–13.0GB | 18.3GB (3.5GB with `mmap`) |
-| `8gb` | the above + transformer block streaming | otherwise | 2.4–2.9GB (+1.4GB if the VAE fits on the GPU) | 27.2GB (12.4GB with `mmap`) |
+| `16gb` | W4A8 + TE layer streaming + VAE swap | ≥ 13.3GB | 12.5–13.0GB | 18.3GB (3.5GB with `file`) |
+| `8gb` | the above + transformer block streaming | otherwise | 2.4–2.9GB (+1.4GB if the VAE fits on the GPU) | 27.2GB (12.4GB with `file`; 2.3GB if the transformer is `file` too) |
 
-`mmap` keeps the text encoder's weights in the page cache instead of pinned RAM; it is selected by default on PCs
+`file` reads the text encoder layer by layer straight from the file instead of pinning it in RAM; it is selected by default on PCs
 with less than 48GB of RAM ([details below](#vram-reserve-and-a-setting-for-pcs-with-little-ram)).
 
 - With two GPUs, the TE goes to the second one by default (`H3IMG_TE_GPU`). Choose the GPU by index, e.g.
@@ -152,8 +152,8 @@ The contents of `models/` (`te/`, `lora/`, `cache/`) may be symlinks or real dir
 ### Windows (untested)
 
 Windows wheels exist for all dependencies (torch 2.11+cu130, comfy-kitchen, bitsandbytes, torchao; use `triton-windows`
-for Triton). The only OS-specific code is reading RAM figures and `madvise`; on Windows the former uses Win32 APIs and
-the latter is skipped. **Not yet verified on a real Windows machine** (this note will be removed once it is).
+for Triton). The only OS-specific code is reading RAM figures and page-cache hints (`madvise` / `fadvise`); on Windows the
+former uses Win32 APIs and the latter is replaced by `FILE_FLAG_SEQUENTIAL_SCAN`. **Not yet verified on a real Windows machine** (this note will be removed once it is).
 
 With uv (install it with `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"` and
 reopen PowerShell afterwards):
@@ -178,8 +178,10 @@ py -3.12 -m venv .venv                      # or python -m venv .venv if `py` is
 ```
 
 - An NVIDIA driver supporting CUDA 13 is required.
-- Windows has no `madvise`, so in the page-cache streaming (`mmap`) configurations the "drop used layers" and
-  "drop the overflow blocks" tricks do not apply; on PCs with little RAM, re-reads may be more frequent than on Linux.
+- On PCs with little RAM the weights are streamed with the `file` method on both Linux and Windows (read directly from
+  the file, no page cache). The `mmap` method (page cache + `madvise`) is Linux-only.
+- If PowerShell refuses to run `.\run.ps1` because of the execution policy, start it with
+  `powershell -ExecutionPolicy Bypass -File .\run.ps1`.
 - If your torch build does not support `expandable_segments`, it only warns and continues.
 
 ### Hugging Face access
@@ -214,7 +216,7 @@ H3IMG_GPU=0 H3IMG_TE_GPU=1 ./run.sh
 # Set the budget: run the 16GB-class configuration (W4A8 + TE streaming) even on a 96GB GPU
 H3IMG_VRAM_GB=16 ./run.sh
 
-# Force the 8GB-class configuration (required host RAM ~27GB; on PCs with <48GB RAM it switches to mmap, ~12GB)
+# Force the 8GB-class configuration (required host RAM ~27GB; on PCs with <48GB RAM it switches to file, ~2GB + cache)
 H3IMG_VRAM_GB=8 ./run.sh
 
 # Set only the quantization (overrides the budget): W4A8 with the TE resident (the 32GB-class configuration)
@@ -233,8 +235,8 @@ H3IMG_VRAM_FALLBACK=0 ./run.sh
 | `H3IMG_TRANSFORMER_STREAM` | `auto` / `0` / `1` | Transformer block streaming (resident 11GB → 1GB) |
 | `H3IMG_VRAM_FALLBACK` | `1` / `0` | Step down one profile automatically on OOM during generation |
 | `H3IMG_VRAM_RESERVE_GB` | number (default 1.0) | VRAM that is always left free (for the display etc.) |
-| `H3IMG_TE_HOST` | `auto` / `pinned` / `mmap` | Where the text encoder's weights live (`mmap` is for PCs with 32GB of RAM) |
-| `H3IMG_TRANSFORMER_HOST` | `auto` / `pinned` / `mmap` | Where the transformer blocks live (`mmap` is for PCs with 16GB of RAM; speed then depends on the SSD) |
+| `H3IMG_TE_HOST` | `auto` / `pinned` / `file` / `mmap` | Where the text encoder's weights live (`file` is for PCs with ≤32GB of RAM) |
+| `H3IMG_TRANSFORMER_HOST` | `auto` / `pinned` / `file` / `mmap` | Where the transformer blocks live (`file` is for PCs with 16GB of RAM; speed then depends on the SSD) |
 
 | Profile | Quantization | TE | transformer | Budget needed | Speed (1024² / 2048², TE pinned) |
 |---|---|---|---|---|---|
@@ -350,9 +352,9 @@ are fetched into `models/prompts/` from the PE repository and GitHub on first us
 | `H3IMG_TRANSFORMER_QUANT` | auto | Transformer quantization (`int8wo` 19GiB / `ck-w4a8` ~11GB). auto follows the profile |
 | `H3IMG_TE_STREAM` | auto | Text-encoder layer streaming (with lm_head removal, CPU embedding and VAE swap). Set 0 / 1 explicitly |
 | `H3IMG_TRANSFORMER_STREAM` | auto | Streaming of the 50 transformer blocks (8GB class). Set 0 / 1 explicitly |
-| `H3IMG_TE_HOST` | auto | Text-encoder weights: `pinned` (fast, ~13GB of RAM) / `mmap` (page cache, for PCs with little RAM). auto = pinned with ≥48GB of RAM |
-| `H3IMG_TRANSFORMER_HOST` | auto | Transformer blocks (8gb profile): `pinned` (~10GB of RAM) / `mmap` (streamed from the quantization cache's page cache; for PCs with 16GB of RAM, re-read from disk every generation). auto follows the TE rule |
-| `H3IMG_TRANSFORMER_DROP_BLOCKS` | auto | With `mmap`, how many trailing blocks to drop from the page cache after use. auto = only the overflow that does not fit in RAM; 0 = never |
+| `H3IMG_TE_HOST` | auto | Text-encoder weights: `pinned` (fast, ~13GB of RAM) / `file` (each layer read straight from the file; for PCs with little RAM, any OS) / `mmap` (page cache + madvise, Linux only). auto = pinned with ≥48GB of RAM, otherwise file |
+| `H3IMG_TRANSFORMER_HOST` | auto | Transformer blocks (8gb profile): `pinned` (~10GB of RAM) / `file` or `mmap` (streamed from the quantization cache's page cache, overflow re-read from disk; for PCs with 16GB of RAM). auto follows the TE rule |
+| `H3IMG_TRANSFORMER_DROP_BLOCKS` | auto | With `file` / `mmap`, how many trailing blocks to re-read (file) or drop (mmap) after use. auto = only the overflow that does not fit in RAM; 0 = never |
 | `H3IMG_GENERATION_AREA` | requested | Default canvas (`native` = at least 4MP) |
 | `H3IMG_PRELOAD` | 0 | 1 = load at startup |
 | `H3IMG_MODELS_DIR` | `./models` | Location of te / lora / cache |
@@ -392,7 +394,7 @@ result the 8GB configuration runs at the same speed as the 16GB one, with pixel-
 
 How far each method is used is decided automatically from the VRAM budget
 ([launch examples](#launch-examples-gpu-vram-budget-quantization)). What is not kept on the GPU stays in host RAM, so
-the 8GB configuration uses about 29GB of host RAM (about 12GB required with the `mmap` setting, which keeps the text
+the 8GB configuration uses about 29GB of host RAM (about 12GB required with the `file` setting, which reads the text
 encoder in the page cache).
 
 ### 1. Replace the AdaLN projections with a precomputed table (VRAM −26GB, zero error)
@@ -551,9 +553,14 @@ RAM).
 **Where the text encoder's weights live (`H3IMG_TE_HOST`)**:
 
 - `pinned`: pinned host RAM (always uses ~13GB). Fast.
-- `mmap`: stream directly from the safetensors file's page cache. The OS can reclaim page cache at any time, so
-  **the required host RAM drops by about 13GB**. In exchange, without pinning, each generation is 0.7–0.9 s slower.
-- `auto` (default): `pinned` if the machine has 48GB of RAM or more, otherwise `mmap`.
+- `file`: each layer is read straight from the safetensors file into a small pinned staging area (2 × 0.26GB) by
+  8 threads in parallel, then copied to the GPU. The page cache is bypassed (Linux drops the range with
+  `fadvise(DONTNEED)`, Windows opens the file with `FILE_FLAG_SEQUENTIAL_SCAN`), so **the required host RAM drops by
+  about 13GB** and nothing else gets evicted. Works on any OS; speed depends on the SSD (a Gen4 NVMe streams the 13GB
+  text encoder in 4 s).
+- `mmap`: stream from the safetensors file's page cache (Linux only; used layers are dropped with `madvise`). Slower
+  than `file` (see below); kept for comparison.
+- `auto` (default): `pinned` if the machine has 48GB of RAM or more, otherwise `file`.
 
 Measured on simulated 8GB / 16GB cards (GPU free memory capped at 7.3GB / 15.5GB, 1GB reserve; all outputs
 identical):
@@ -565,13 +572,15 @@ identical):
 | 16GB | mmap | 14.1GB | 1.7GB | **3.5GB** (+14GB page cache) | 2.2 s | 4.4 s | 7.2 s |
 | 16GB | pinned | 14.1GB | 1.7GB | 18.3GB | 1.3 s | 3.5 s | 6.2 s |
 
-**On a PC with 32GB of RAM, `mmap` is used (selected automatically)**; with 48GB or more, `pinned` is faster.
+The `mmap` rows above need the same RAM with the current default `file`, which is faster (see below).
+**On a PC with 32GB of RAM, `file` is used (selected automatically)**; with 48GB or more, `pinned` is faster.
 
-### A PC with 16GB of RAM and a 6GB GPU (streaming the transformer from the page cache too)
+### A PC with 16GB of RAM and a 6GB GPU (streaming the transformer from the file / page cache too)
 
-With `H3IMG_TRANSFORMER_HOST=mmap`, the 50 transformer blocks are also streamed straight from the quantization cache's
-page cache, and the required host RAM drops to **about 1.8GB** (the process's anonymous memory). In exchange, whatever
-does not fit in RAM is **re-read from disk on every generation**, so speed is set by the SSD's sequential read rate.
+With `H3IMG_TRANSFORMER_HOST=file` (the default below 48GB of RAM), the 50 transformer blocks are also streamed straight
+from the quantization cache (safetensors) in the page cache, and the required host RAM drops to **about 2GB** (the
+process's anonymous memory). In exchange, whatever does not fit in RAM is **re-read from disk on every generation**,
+so speed is set by the SSD's sequential read rate.
 
 Measured on an RTX 4000 SFF Ada 20GB with its free memory capped at 6GB and the process limited to 12GB of memory
 (equivalent to a 16GB PC), on a Gen4 NVMe reading at 2.3GB/s, with a 1GB reserve; outputs are pixel-identical to the
@@ -580,28 +589,39 @@ pinned configuration:
 | Configuration | 1024² | 2048² | Edit 1664×2496 | Disk read per image | Required RAM |
 |---|---|---|---|---|---|
 | pinned (no RAM cap, same Ada card) | 8.2 s | 12.7 s | 24.3 s | 0 | 27GB |
-| mmap × mmap, 12GB cap (current) | **12.5–12.8 s** | **16.6 s** | **28.9 s** | 13–14GB | 1.8GB |
+| **file × file, 12GB cap (current default; 5 trailing blocks read from the file)** | **10.5 s** | **14.4 s** | — | 16GB | 2.3GB |
+| same, 11GB cap (10 trailing blocks) | 10.6 s | 14.5 s | — | 19GB | 2.3GB |
+| same, 10GB cap (15 trailing blocks) | 11.1 s | 14.5 s | — | 22GB | 2.3GB |
+| mmap × mmap, 12GB cap (previous Linux-only default) | 12.5–12.8 s | 16.6 s | 28.9 s | 13–14GB | 1.8GB |
 | same, 11GB cap (6 trailing blocks dropped) | 13.5 s | 17.3 s | — | 16.7GB | 1.8GB |
 | same, 10GB cap (11 trailing blocks dropped) | 13.9 s | 17.6 s | — | 19.7GB | 1.8GB |
-| reference: without dropping used layers | 17.8–21.3 s | 20.5–23.5 s | 31.2 s | 24–27GB | 1.8GB |
+| reference: without dropping used layers (mmap) | 17.8–21.3 s | 20.5–23.5 s | 31.2 s | 24–27GB | 1.8GB |
 
-- The extra time is the disk itself (bytes read ÷ 2.3GB/s). Prefetching pages with `madvise(MADV_WILLNEED)` did not
-  help because the disk was already saturated. With a 7GB/s-class NVMe the difference shrinks to about 2 s; with a
-  SATA SSD it grows to about +25 s.
-- **Each text-encoder layer is read only once**, so its pages are dropped from the page cache right after use
-  (`madvise(MADV_PAGEOUT)`). Without this, the 13GB text encoder pushed the 10GB transformer out of the cache on every
+- `file` beats `mmap` because of how it reads. Going through the page cache (mmap page faults, or a single-threaded
+  `read`) topped out at 1.6GB/s, whereas reading all tensors of a layer as 32MB chunks on 8 threads at once reaches
+  4GB/s on the same NVMe (the 13GB text-encoder pass went from 8.4 s to 4.0 s). It reads slightly more than `mmap`
+  (the trailing blocks) yet finishes sooner. On a SATA SSD expect about +30 s (bytes read ÷ 0.5GB/s).
+- The `file` staging buffers are ordinary memory pinned with `cudaHostRegister`, not `pin_memory()` (cudaHostAlloc):
+  the latter is charged to the cgroup as "file" memory, which escaped the page-cache budget (it subtracts anonymous
+  memory) and pushed the transformer out of the cache (re-reads rose to 28GB in measurements).
+- **Each text-encoder layer is read only once**, so it is never kept in the page cache (`file` drops the range it read
+  with `fadvise`, `mmap` uses `madvise(MADV_PAGEOUT)`). Without this, the 13GB text encoder pushed the 10GB transformer out of the cache on every
   pass and 24GB were re-read each time. With it, the transformer stays cached and only the 13GB of the text encoder is
   re-read (this holds even with a 12GB cap; output unchanged).
 - **When the transformer does not fit in the cache, only the overflow is dropped**: the trailing K blocks are
   evicted after use (`H3IMG_TRANSFORMER_DROP_BLOCKS`, default `auto`). Re-reading a fixed K blocks per step
   (0.2GB × K × 3 steps) is far cheaper than letting the LRU evict everything and re-read it every step (24.6GB with an
-  11GB cap), so each 1GB less of RAM costs only +0.4–0.5 s. K is derived from the RAM available to the page cache
-  (cgroup limits are honored). The mmap pages of parts placed on the GPU (token refiner etc.) are dropped after
-  loading to free cache space as well.
+  11GB cap), so each 1GB less of RAM costs only +0.3–0.5 s. K is derived from the RAM available to the page cache
+  (cgroup limits are honored). With `file` the K blocks are read straight from the file (the rest stay mmap'd in the
+  page cache); with `mmap` they are dropped after use. The mmap pages of parts placed on the GPU (token refiner etc.)
+  are dropped after loading to free cache space as well (Linux).
+- Tensor positions inside the file come from the safetensors header: for an mmap'd tensor, "address − start of the
+  mapping" is the file offset, so no names are needed. The W4A8 quantization cache is therefore saved as safetensors
+  (an older `.pt` cache is converted automatically on first load).
 - The Ada numbers above are this project's first measurements on a non-Blackwell, 70W small card (x4 link). The
   W4A8 kernels (comfy-kitchen) run on sm_89, 1.9× faster than bf16 per layer. The arithmetic differs from
   Blackwell, so outputs are not pixel-identical across the two (mean difference ~7/255, same composition).
-- These tricks rely on `madvise` and so apply on Linux only; on Windows the OS decides what stays cached.
+- `file` works on Windows as well; only the `mmap` variant relies on `madvise` and is Linux-only.
 
 ### Things tried and not adopted
 

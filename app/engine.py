@@ -14,6 +14,7 @@ import functools
 from dataclasses import dataclass
 import logging
 import threading
+import sys
 import time
 from pathlib import Path
 
@@ -219,7 +220,9 @@ class Engine:
         if te_stream and self.vae_on_gpu:
             headroom -= VAE_GPU_GB
         self.embed_on_gpu = te_stream and headroom >= EMBED_GPU_GB
-        auto_host = "pinned" if _host_ram_gb() >= TE_PINNED_MIN_HOST_GB else "mmap"
+        # RAM が少ないときの原本は file(層ごとにファイルから直接ピン留めバッファへ並列読み。OS を問わず動き、
+        # mmap + madvise より速い: 12GB 上限で 10.5s vs 12.3s、実測)
+        auto_host = "pinned" if _host_ram_gb() >= TE_PINNED_MIN_HOST_GB else "file"
         self.te_host = (self.s.te_host if self.s.te_host != "auto" else auto_host) if te_stream else None
         self.transformer_host = (self.s.transformer_host if self.s.transformer_host != "auto" else auto_host) \
             if tr_stream else None
@@ -269,8 +272,10 @@ class Engine:
         # 約 13GB 減る(OS が回収できるメモリになる)。"pinned": cudaHostRegister でピン留めした原本(速いが常に使う)。
         # mmap のときは使い終わった層のページをその場で捨てる(1 回しか読まないので、残すと transformer の
         # ページキャッシュを押し出すだけ。RAM の少ない PC で transformer を読み直さずに済むようにする)
+        # "file": ページキャッシュを経由せず、層ごとにファイルから直接ピン留めバッファへ読んで流す(Windows の既定)
         pruned_image.stream_layers(lm.layers, dev, owner="te", prefetch=False, pin=self.te_host == "pinned",
-                                   drop_after_use=self.te_host == "mmap")
+                                   drop_after_use=self.te_host in ("mmap", "file"),
+                                   file_paths=sorted(self.s.te_dir.glob("*.safetensors")) if self.te_host == "file" else None)
         te.lm_head = _UnusedHead()
         emb = lm.embed_tokens
         if self.embed_on_gpu:
@@ -359,8 +364,9 @@ class Engine:
         stream = self._transformer_stream_enabled()
         tr = pruned_image.load_transformer(self._resolve_repo(), self.pipe, self.device,
                                            self.s.cache_dir / cache_name, quant=quant, lora_path=lora,
-                                           stream_blocks=stream, pin_blocks=self.transformer_host != "mmap",
-                                           drop_blocks=self.s.transformer_drop_blocks)
+                                           stream_blocks=stream, pin_blocks=self.transformer_host == "pinned",
+                                           drop_blocks=self.s.transformer_drop_blocks,
+                                           file_blocks=self.transformer_host == "file")
         self.transformer_streamed = stream
         self._install_progress_hook(tr, steps)
         logger.info("transformer (steps=%d) ready in %.1fs, alloc=%.2fGB", steps, time.time() - t0,
@@ -448,6 +454,7 @@ class Engine:
         _gc.collect()
         for owner in ("te", "vae", "transformer"):
             pruned_image.release_pinned(owner)
+            pruned_image.release_file_streamers(owner)
         self.profile = None
         import gc
         gc.collect()

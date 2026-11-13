@@ -38,7 +38,8 @@ from safetensors import safe_open
 logger = logging.getLogger("h3image.pruned")
 
 QUANT_SUFFIXES = ("attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0", "ff.net.0.proj", "ff.net.2")
-STATE_FILENAME = "transformer_int8wo_adaln_table.pt"
+STATE_FILENAME = "transformer_int8wo_adaln_table.pt"               # torchao の Int8Tensor を含む(int8wo)
+STATE_FILENAME_ST = "transformer_adaln_table.safetensors"          # 素のテンソルだけのとき(ck-w4a8)
 MODALITY_NUM = 3
 
 
@@ -207,6 +208,14 @@ class CKW4A8Linear(nn.Linear):
 
 _PINNED: dict[str, list[torch.Tensor]] = {}
 _ALIGN = 256
+
+
+_FILE_STREAMERS: dict[str, list] = {}
+
+
+def release_file_streamers(owner: str) -> None:
+    for fs in _FILE_STREAMERS.pop(owner, []):
+        fs.close()
 
 
 def release_pinned(owner: str) -> float:
@@ -450,12 +459,15 @@ def pageout_tensors(tensors) -> None:
 
 
 def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = True, pin: bool = True,
-                  drop_after_use: bool = False, drop_last: int = 0) -> None:
+                  drop_after_use: bool = False, drop_last: int = 0, file_paths: list[Path] | None = None) -> None:
     """layers(順に呼ばれる層の列)をピン留めした原本に置き、forward hook で 1 つずつ GPU へ流す。
     層 i の計算中に i+1 を別 stream で先読みする。
 
     先読みは copy stream 上で行うので、GPU 側テンソルに `record_stream(計算 stream)` を付け、計算が終わる前に
     アロケータがその領域を次の先読みに再利用しないようにする(これを欠くと出力が黒画像になる、実測)。
+
+    file_paths(pin=False のとき): 原本の safetensors。drop_after_use なら全層を、drop_last>0 なら末尾 K 層を、
+    ページキャッシュを経由せずファイルから直接読む(filestream、madvise の無い Windows 向け。Linux でも使える)。
     """
     masters = []
     for layer in layers:
@@ -469,6 +481,22 @@ def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = Tru
     # drop_last: 末尾 K 層は使い終わったらページを捨てる(mmap で原本がキャッシュに収まりきらないとき、
     # 全部が LRU で押し出されるより、決まった K 層だけを読み直す方が安い)
     drop_last = min(max(int(drop_last), 0), len(masters)) if not pin else 0
+    if file_paths and not pin and (drop_after_use or drop_last > 0):
+        from . import filestream
+        first = 0 if drop_after_use else n - drop_last
+        fs = filestream.install(list(layers)[first:], masters[first:], [Path(p) for p in file_paths], device, owner)
+        _FILE_STREAMERS.setdefault(owner, []).append(fs)
+        if first == 0:
+            return                       # 全層ファイル読み
+        # 手前の層は従来どおり(ページキャッシュ)。末尾 K 層の最初の読み込みは、少し手前の層の pre hook で始める
+        layers, masters, n = list(layers)[:first], masters[:first], first
+        kick = max(0, n - 2)
+
+        def kick_hook(mod, args, kwargs):
+            fs.prefetch(0)
+
+        layers[kick].register_forward_pre_hook(kick_hook, with_kwargs=True)
+        drop_last = 0
     if not prefetch:
         # 先読みなし: 計算と同じ stream でコピーする。解放はストリーム順序で守られるので record_stream が要らず、
         # アロケータの予約が膨らまない(1 回しか通らない TE 向け)。mmap のときはディスクの先読みだけ出す。
@@ -524,7 +552,8 @@ def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = Tru
         layer.register_forward_hook(make_post(i))
 
 
-def install_block_streaming(tr, device: torch.device, pin: bool = True, drop_blocks: str = "auto") -> None:
+def install_block_streaming(tr, device: torch.device, pin: bool = True, drop_blocks: str = "auto",
+                            file_paths: list[Path] | None = None) -> None:
     """transformer_blocks(50 個、ck-w4a8 で各 ~0.2GB)を先読みしながら流す(8gb 構成)。
     pin=False なら原本は量子化キャッシュの mmap(ページキャッシュ)のまま(RAM の少ない PC 向け)。
 
@@ -537,6 +566,8 @@ def install_block_streaming(tr, device: torch.device, pin: bool = True, drop_blo
         per_block = total_gb / len(blocks)
         if drop_blocks == "auto":
             margin = 0.5   # TE の通過中の層・埋め込み表の参照ページなど、キャッシュを共有するものの分
+            if file_paths:
+                margin += 2 * per_block   # file streaming の staging バッファ(ピン留め、匿名メモリ)の分
             avail = host_cache_budget_gb()
             k = int(math.ceil(max(0.0, total_gb + margin - avail) / per_block))
         else:
@@ -544,10 +575,10 @@ def install_block_streaming(tr, device: torch.device, pin: bool = True, drop_blo
         k = min(max(k, 0), len(blocks))
         logger.info("transformer blocks from page cache: %.1fGB, cache budget %.1fGB -> drop %d/%d blocks after use",
                     total_gb, host_cache_budget_gb(), k, len(blocks))
-        if _libc_madvise() is None:
+        if _libc_madvise() is None and not file_paths:
             logger.warning("この OS には madvise が無いため、ページキャッシュの先読み・破棄(drop)は行えません。"
-                           "キャッシュに収まらない場合は OS の判断で読み直しが増えます")
-    stream_layers(blocks, device, owner="transformer", pin=pin, drop_last=k)
+                           "H3IMG_TRANSFORMER_HOST=file にすると、はみ出す分をファイルから直接読みます")
+    stream_layers(blocks, device, owner="transformer", pin=pin, drop_last=k, file_paths=file_paths)
 
 
 def _replace_quant_targets_with_ck_shells(tr) -> None:
@@ -673,7 +704,10 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
             mod_name, _, attr = name.rpartition(".")
             dict(tr.named_modules())[mod_name].register_buffer(attr, buf.to(device), persistent=False)
     if stream_blocks:
-        install_block_streaming(tr, device, pin=pin_blocks, drop_blocks=drop_blocks)
+        paths = [cache_dir / STATE_FILENAME_ST] if file_blocks and (cache_dir / STATE_FILENAME_ST).exists() else None
+        if file_blocks and paths is None:
+            logger.warning("このキャッシュは safetensors ではないので file streaming は使えません(mmap で続行)")
+        install_block_streaming(tr, device, pin=pin_blocks, drop_blocks=drop_blocks, file_paths=paths)
     torch.cuda.empty_cache()
     install_forward_wrapper(tr)
     tr.eval()
@@ -690,7 +724,7 @@ def save_cache(tr, cache_dir: Path) -> None:
     tmp.mkdir(parents=True, exist_ok=True)
     tr.save_config(str(tmp))
     sd = {k: v.detach().cpu() for k, v in tr.state_dict().items()}
-    torch.save(sd, str(tmp / STATE_FILENAME))
+    _save_state(sd, tmp)
     if cache_dir.exists():
         import shutil
         shutil.rmtree(cache_dir)
@@ -699,8 +733,44 @@ def save_cache(tr, cache_dir: Path) -> None:
     logger.info("cache saved: %s (%.1fGiB)", cache_dir, size)
 
 
+def _save_state(sd: dict, dir_: Path) -> Path:
+    """素のテンソルだけなら safetensors(mmap で読める・ファイル位置が分かる=file streaming できる)、
+    テンソルのサブクラス(torchao の Int8Tensor)を含むなら torch.save。"""
+    if all(type(v) is torch.Tensor for v in sd.values()):
+        from safetensors.torch import save_file
+        out = dir_ / STATE_FILENAME_ST
+        save_file({k: v.contiguous() for k, v in sd.items()}, str(out))
+        return out
+    out = dir_ / STATE_FILENAME
+    torch.save(sd, str(out))
+    return out
+
+
+def _load_state(cache_dir: Path) -> dict:
+    """キャッシュの state_dict を mmap で読む。古い .pt(素のテンソルだけ)は safetensors へ変換してから読む。"""
+    st = cache_dir / STATE_FILENAME_ST
+    if st.exists():
+        from safetensors.torch import load_file
+        return load_file(str(st), device="cpu")     # safetensors 0.4+ はゼロコピー(mmap)
+    pt = cache_dir / STATE_FILENAME
+    sd = torch.load(str(pt), map_location="cpu", weights_only=False, mmap=True)
+    if all(type(v) is torch.Tensor for v in sd.values()):
+        t0 = time.time()
+        out = _save_state(sd, cache_dir)
+        del sd
+        pt.unlink()
+        logger.info("cache converted to safetensors: %s (%.0fs, old .pt removed)", out, time.time() - t0)
+        from safetensors.torch import load_file
+        return load_file(str(out), device="cpu")
+    return sd
+
+
+def cache_exists(cache_dir: Path) -> bool:
+    return (cache_dir / STATE_FILENAME).exists() or (cache_dir / STATE_FILENAME_ST).exists()
+
+
 def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = False, pin_blocks: bool = True,
-               drop_blocks: str = "auto"):
+               drop_blocks: str = "auto", file_blocks: bool = False):
     from accelerate import init_empty_weights
     from diffusers import MiniMaxH3ImageTransformer2DModel as Cls
 
@@ -709,7 +779,7 @@ def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = Fals
     with init_empty_weights():
         tr = Cls.from_config(config)
     # mmap で読む: 量子化キャッシュ全体(11〜19GiB)をホスト RAM へ展開せず、必要なページだけ読む
-    sd = torch.load(str(cache_dir / STATE_FILENAME), map_location="cpu", weights_only=False, mmap=True)
+    sd = _load_state(cache_dir)
     hidden = config["hidden_size"]
     if any(k.endswith(".qdata") for k in sd):
         _replace_quant_targets_with_ck_shells(tr)
@@ -726,7 +796,10 @@ def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = Fals
                 child.to(device)
         if not pin_blocks:
             pageout_tensors(others)   # GPU に置いた分のページはもう読まない。キャッシュの枠をブロックに譲る
-        install_block_streaming(tr, device, pin=pin_blocks, drop_blocks=drop_blocks)
+        paths = [cache_dir / STATE_FILENAME_ST] if file_blocks and (cache_dir / STATE_FILENAME_ST).exists() else None
+        if file_blocks and paths is None:
+            logger.warning("このキャッシュは safetensors ではないので file streaming は使えません(mmap で続行)")
+        install_block_streaming(tr, device, pin=pin_blocks, drop_blocks=drop_blocks, file_paths=paths)
     else:
         tr = tr.to(device)
     install_forward_wrapper(tr)
@@ -738,15 +811,16 @@ def load_cache(cache_dir: Path, device: torch.device, stream_blocks: bool = Fals
 
 def load_transformer(repo: str, pipe, device: torch.device, cache_dir: Path, quant: str = "int8wo",
                      lora_path: str | None = None, stream_blocks: bool = False, pin_blocks: bool = True,
-                     drop_blocks: str = "auto"):
+                     drop_blocks: str = "auto", file_blocks: bool = False):
     """キャッシュがあれば読む、無ければ構築して保存する(bnb-int8 は毎回構築)。"""
     keys = timestep_keys(pipe)
     logger.info("AdaLN timestep keys: %s", keys.tolist())
     if quant == "bnb-int8":
         return build_fresh(repo, device, keys, verify=True, quant=quant, lora_path=lora_path,
                            stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks)
-    if (cache_dir / STATE_FILENAME).exists():
-        tr = load_cache(cache_dir, device, stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks)
+    if cache_exists(cache_dir):
+        tr = load_cache(cache_dir, device, stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks,
+                        file_blocks=file_blocks)
         cached = next(m for m in tr.modules() if isinstance(m, AdaLNTable)).keys.cpu()
         if not torch.equal(cached, keys):
             raise RuntimeError(f"キャッシュの時刻集合 {cached.tolist()} が現在の {keys.tolist()} と異なります。"
