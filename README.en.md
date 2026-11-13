@@ -72,8 +72,8 @@ with less than 48GB of RAM ([details below](#vram-reserve-and-a-setting-for-pcs-
 - The selected profile is shown as `engine.profile` in `/api/status` and as `profile` in job results.
 
 The W4A8 configurations were verified on an RTX PRO 6000 (sm_120) with its free memory capped at 23.5GB / 15.5GB /
-7.3GB (not yet on real 8–32GB cards; the kernels are Triton/CUDA implementations and should work on other
-generations, but this has not been confirmed).
+7.3GB (on real cards, the `8gb` profile has been verified on an RTX 4000 SFF Ada 20GB (sm_89, free memory capped at
+6GB) and on a **Windows RTX 3050 6GB (sm_86)**; real 12GB / 24GB cards are untested).
 
 Host RAM for building the cache: bf16 is handled one tensor at a time, so no large amount of RAM is needed
 (peak +a few GB). For disk space see [Installation](#installation).
@@ -199,6 +199,8 @@ py -3.12 -m venv .venv                      # or python -m venv .venv if `py` is
 
 The official repository is public, but some environments need `HF_TOKEN`. `scripts/prepare_models.py` uses the usual
 `huggingface_hub` cache (`~/.cache/huggingface/hub`).
+If a download stalls with no network traffic (this happened with the xet transfer mode of recent `huggingface_hub`),
+rerun with `HF_HUB_DISABLE_XET=1` to use plain HTTP (resumable).
 
 ## Running and usage
 
@@ -736,7 +738,8 @@ candidate).
 ### Not yet verified
 
 - Quality comparison against the bf16 model (to isolate the text breakage), VRAM and time at 4096² and above, edits
-  with multiple (2+) references, nvfp4, CUDA Graphs, and measurements on real 8–32GB cards.
+  with multiple (2+) references, nvfp4, CUDA Graphs, measurements on real 12GB / 24GB cards, and an end-to-end run
+  of `prepare_models.py` (quantization) on a real Windows machine (verified on Linux).
 
 ## Background
 

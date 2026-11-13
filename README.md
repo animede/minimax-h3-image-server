@@ -66,7 +66,8 @@ diffusers(main)ベース、コードは MIT ライセンス。
 - 選ばれたプロファイルは `/api/status` の `engine.profile` とジョブ結果の `profile` で確認できます。
 
 W4A8 の 3 構成は GPU の空きを 23.5GB / 15.5GB / 7.3GB に制限した RTX PRO 6000(sm_120)で検証した値です
-(本物の 8〜32GB カードでは未検証。カーネルは Triton/CUDA 実装なので他世代でも動く見込みですが確認していません)。
+(実カードでは RTX 4000 SFF Ada 20GB(sm_89、空きを 6GB に制限)と **Windows の RTX 3050 6GB(sm_86)** で `8gb` 構成の
+動作を確認済み。12GB / 24GB の実カードは未検証)。
 
 ホスト RAM: 量子化キャッシュがある状態では数 GB。初回のキャッシュ構築も bf16 を 1 テンソルずつ扱うため
 大きな RAM は要りません(実測ピーク +数 GB)。ディスクは [導入](#導入) 参照。
@@ -188,6 +189,8 @@ py -3.12 -m venv .venv                      # py が無ければ python -m venv 
 
 本家リポジトリは公開ですが、環境によっては `HF_TOKEN` が必要です。`scripts/prepare_models.py` は
 `huggingface_hub` の通常のキャッシュ(`~/.cache/huggingface/hub`)を使います。
+ダウンロードが途中で無通信のまま止まる場合(新しい `huggingface_hub` の xet 方式で実際に起きました)は、
+`HF_HUB_DISABLE_XET=1` を付けて再実行すると通常の HTTP(途中から再開可)になります。
 
 ## 起動と使い方
 
@@ -688,7 +691,8 @@ VRAM 目的のみ。1024² では GPU より CPU 側のカーネル発行が律�
 ### 未検証
 
 - bf16 本体との品質比較(文字崩れの切り分け)、4096² 以上の VRAM・時間、複数参照(2 枚以上)の編集、
-  nvfp4、CUDA Graph 化、実物の 8〜32GB カードでの計測。
+  nvfp4、CUDA Graph 化、12GB / 24GB の実カードでの計測、Windows 実機での `prepare_models.py`(量子化)の通し実行
+  (Linux では検証済み)。
 
 ## 経緯
 
