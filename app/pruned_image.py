@@ -459,7 +459,8 @@ def pageout_tensors(tensors) -> None:
 
 
 def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = True, pin: bool = True,
-                  drop_after_use: bool = False, drop_last: int = 0, file_paths: list[Path] | None = None) -> None:
+                  drop_after_use: bool = False, drop_last: int = 0, file_paths: list[Path] | None = None,
+                  file_root: nn.Module | None = None) -> None:
     """layers(順に呼ばれる層の列)をピン留めした原本に置き、forward hook で 1 つずつ GPU へ流す。
     層 i の計算中に i+1 を別 stream で先読みする。
 
@@ -468,6 +469,7 @@ def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = Tru
 
     file_paths(pin=False のとき): 原本の safetensors。drop_after_use なら全層を、drop_last>0 なら末尾 K 層を、
     ページキャッシュを経由せずファイルから直接読む(filestream、madvise の無い Windows 向け。Linux でも使える)。
+    file_root: 層の safetensors 上の名前を引くためのルートモジュール(層のモジュールパス = ファイル上のキーの接頭辞)。
     """
     masters = []
     for layer in layers:
@@ -484,7 +486,10 @@ def stream_layers(layers, device: torch.device, owner: str, prefetch: bool = Tru
     if file_paths and not pin and (drop_after_use or drop_last > 0):
         from . import filestream
         first = 0 if drop_after_use else n - drop_last
-        fs = filestream.install(list(layers)[first:], masters[first:], [Path(p) for p in file_paths], device, owner)
+        mod_names = {id(m): nm for nm, m in file_root.named_modules()}
+        prefixes = [mod_names[id(l)] + "." for l in list(layers)[first:]]
+        fs = filestream.install(list(layers)[first:], masters[first:], [Path(p) for p in file_paths], device, owner,
+                                prefixes)
         _FILE_STREAMERS.setdefault(owner, []).append(fs)
         if first == 0:
             return                       # 全層ファイル読み
@@ -578,7 +583,7 @@ def install_block_streaming(tr, device: torch.device, pin: bool = True, drop_blo
         if _libc_madvise() is None and not file_paths:
             logger.warning("この OS には madvise が無いため、ページキャッシュの先読み・破棄(drop)は行えません。"
                            "H3IMG_TRANSFORMER_HOST=file にすると、はみ出す分をファイルから直接読みます")
-    stream_layers(blocks, device, owner="transformer", pin=pin, drop_last=k, file_paths=file_paths)
+    stream_layers(blocks, device, owner="transformer", pin=pin, drop_last=k, file_paths=file_paths, file_root=tr)
 
 
 def _replace_quant_targets_with_ck_shells(tr) -> None:

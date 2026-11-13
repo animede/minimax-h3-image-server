@@ -275,7 +275,8 @@ class Engine:
         # "file": ページキャッシュを経由せず、層ごとにファイルから直接ピン留めバッファへ読んで流す(Windows の既定)
         pruned_image.stream_layers(lm.layers, dev, owner="te", prefetch=False, pin=self.te_host == "pinned",
                                    drop_after_use=self.te_host in ("mmap", "file"),
-                                   file_paths=sorted(self.s.te_dir.glob("*.safetensors")) if self.te_host == "file" else None)
+                                   file_paths=sorted(self.s.te_dir.glob("*.safetensors")) if self.te_host == "file" else None,
+                                   file_root=te)
         te.lm_head = _UnusedHead()
         emb = lm.embed_tokens
         if self.embed_on_gpu:

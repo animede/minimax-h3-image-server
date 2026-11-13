@@ -51,53 +51,71 @@ class FileRegion:
         self.path, self.offset, self.nbytes, self.dtype, self.shape = path, offset, nbytes, dtype, shape
 
 
-def _find_base(layout: dict, size: int, tensors: list[torch.Tensor]) -> int | None:
-    """mmap 上のテンソル群から、このファイルのマッピング先頭アドレスを求める(名前は使わない)。
-    あるテンソルの data_ptr − 候補オフセットを仮の先頭とし、同じ範囲に入る他のテンソル全部がレイアウトと
-    一致する候補を採用する。どのテンソルもこのファイルに無ければ None。"""
-    by_off = {off: nb for off, nb in layout.values()}
-    for t in tensors:
-        nb = t.numel() * t.element_size()
-        for off, size_t in layout.values():
-            if size_t != nb:
-                continue
-            base = t.data_ptr() - off
-            ok = True
-            for u in tensors:
-                rel = u.data_ptr() - base
-                if 0 <= rel < size and by_off.get(rel, -1) < u.numel() * u.element_size():
-                    ok = False
-                    break
-            if ok:
-                return base
-        return None    # 最初のテンソルがこのファイルに無い(他のテンソルも同じファイル群から来ている前提で打ち切り)
-    return None
+_QUANT_STATE_KEYS = {"absmax": ".absmax", "code": ".quant_map"}     # bitsandbytes の QuantState → safetensors の接尾辞
 
 
-def resolve_regions(paths: list[Path], masters: list[list[tuple]]) -> list[list[FileRegion]]:
-    """mmap 上のテンソル(masters[i] = [(slot, tensor)])のファイル内位置を求める。paths は候補ファイル(シャード)。"""
-    all_t = [t for lay in masters for _, t in lay]
-    files = []
+def named_slots(module: torch.nn.Module, prefix: str) -> list:
+    """pruned_image._slots() と同じ順序で、各スロットの safetensors 上の名前を返す(無ければ None)。
+    bnb の Params4bit は weight 本体に加えて quant_state の absmax(`<name>.absmax`)と code(`<name>.quant_map`)。
+    offset / 二重量子化の state2 は名前が無い(小さいので常駐させる)。"""
+    names, seen = [], set()
+    entries = list(module.named_parameters()) + list(module.named_buffers())
+    for name, t in entries:
+        if id(t) in seen:
+            continue
+        seen.add(id(t))
+        names.append(prefix + name)
+        qs = getattr(t, "quant_state", None)
+        if qs is not None:
+            _quant_state_names(qs, prefix + name, names)
+    return names
+
+
+def _quant_state_names(qs, base: str, out: list) -> None:
+    for attr in ("absmax", "code", "offset"):
+        if isinstance(getattr(qs, attr, None), torch.Tensor):
+            out.append(base + _QUANT_STATE_KEYS[attr] if attr in _QUANT_STATE_KEYS else None)
+    if getattr(qs, "state2", None) is not None:       # 二重量子化の state2: ファイル上の名前が無い → 常駐
+        for attr in ("absmax", "code", "offset"):
+            if isinstance(getattr(qs.state2, attr, None), torch.Tensor):
+                out.append(None)
+
+
+_DTYPES = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "U8": torch.uint8, "I8": torch.int8,
+           "I32": torch.int32, "I64": torch.int64, "F8_E4M3": torch.float8_e4m3fn, "BOOL": torch.bool}
+
+
+def resolve_regions(paths: list[Path], masters: list[list[tuple]], names: list[list[str | None]]
+                    ) -> list[list[FileRegion | None]]:
+    """各スロットの safetensors 上の位置を名前で引く。masters[i] = [(slot, 今のテンソル)]、names[i] = 対応する名前。
+    名前が無い / ファイルに無い / 大きさが合わないスロットは None(呼び出し側が GPU に常駐させる)。
+    mmap のアドレスに頼らないので、safetensors の読み方が違う環境(Windows 等)でも使える。"""
+    index: dict[str, tuple[Path, int, int, torch.dtype, tuple]] = {}
     for path in paths:
-        _, layout = safetensors_layout(path)
-        size = os.path.getsize(path)
-        base = _find_base(layout, size, all_t)
-        if base is not None:
-            files.append((path, base, size, {off: nb for off, nb in layout.values()}))
-    out = []
-    for lay in masters:
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(n))
+        data0 = 8 + n
+        for k, v in header.items():
+            if k != "__metadata__":
+                index[k] = (path, data0 + v["data_offsets"][0], v["data_offsets"][1] - v["data_offsets"][0],
+                            _DTYPES.get(v["dtype"]), tuple(v["shape"]))
+    out, missing = [], []
+    for lay, lay_names in zip(masters, names):
         regs = []
-        for _, t in lay:
+        for (_, t), name in zip(lay, lay_names):
+            ent = index.get(name) if name else None
             nb = t.numel() * t.element_size()
-            for path, base, size, by_off in files:
-                rel = t.data_ptr() - base
-                if 0 <= rel < size and by_off.get(rel, -1) >= nb:
-                    regs.append(FileRegion(path, rel, nb, t.dtype, tuple(t.shape)))
-                    break
+            if ent is None or ent[2] != nb or ent[3] != t.dtype:
+                regs.append(None)
+                if name:
+                    missing.append(name)
             else:
-                raise RuntimeError("テンソルの位置が safetensors のレイアウトと一致しません"
-                                   "(mmap で読まれていない、または別ファイルのテンソルです)")
+                regs.append(FileRegion(ent[0], ent[1], nb, t.dtype, tuple(t.shape)))
         out.append(regs)
+    if missing:
+        logger.warning("file streaming: %d tensors not found in the files (kept resident on the GPU), e.g. %s",
+                       len(missing), missing[:3])
     return out
 
 
@@ -275,11 +293,25 @@ def _set(slot, value: torch.Tensor) -> None:
         setattr(obj, attr, value)
 
 
-def install(layers, masters: list[list[tuple]], paths: list[Path], device: torch.device, label: str) -> FileStreamer:
-    """layers(すべて同じ長さの masters と対応)に file streaming の hook を付ける。
-    masters[i] = [(slot, mmap 上の原本テンソル)]。原本の位置は paths の safetensors から逆算する。"""
-    regions = resolve_regions(paths, masters)
-    layer_regions = [[(slot, r) for (slot, _), r in zip(masters[i], regions[i])] for i in range(len(masters))]
+def install(layers, masters: list[list[tuple]], paths: list[Path], device: torch.device, label: str,
+            prefixes: list[str]) -> FileStreamer:
+    """layers(masters / prefixes と同じ長さ)に file streaming の hook を付ける。
+    masters[i] = [(slot, 今の原本テンソル)]、prefixes[i] = その層の safetensors 上の名前の接頭辞("...layers.7.")。
+    ファイルに無い小さなテンソルは GPU に常駐させる。原本(CPU 側)は 0 要素のプレースホルダに差し替えて手放す
+    (RAM に展開されていた重み・mmap の参照を解放する。以後は毎回ファイルから読む)。"""
+    names = [named_slots(layer, pfx) for layer, pfx in zip(layers, prefixes)]
+    regions = resolve_regions(paths, masters, names)
+    layer_regions = []
+    for i in range(len(masters)):
+        plan = []
+        for (slot, t), r in zip(masters[i], regions[i]):
+            if r is None:
+                _set(slot, t.to(device))          # 常駐
+            else:
+                plan.append((slot, r))
+                _set(slot, torch.empty(0, dtype=t.dtype))
+        layer_regions.append(plan)
+    masters = [[(slot, torch.empty(0, dtype=r.dtype)) for slot, r in plan] for plan in layer_regions]
     fs = FileStreamer(layer_regions, device, label)
     n = len(layers)
 
