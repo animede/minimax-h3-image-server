@@ -1,5 +1,7 @@
 # minimax-h3-image-server
 
+日本語 | [English](README.en.md)
+
 [MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)(33B、静止画生成 +
 最大 16 枚参照の編集)を **約 21GB の VRAM で、1024² を 1.8 秒・2048² を 4.1 秒**で動かす
 単独の画像サーバ + ブラウザ UI です。**W4A8 量子化 + text_encoder の層ストリーミングで 16GB 1 枚でも動き、さらに transformer の
@@ -38,16 +40,19 @@
 | transformer(int8wo + AdaLN テーブル)+ VAE | **~19GB** | 生成時 peak 20.8GB(1024²)〜21.4GB(2048² 編集)。実測は 4096² 未確認 |
 | text_encoder(Qwen3-VL-32B、nf4・51 層) | **~17GB** | 2 枚目の GPU があれば自動でそちらへ(`H3IMG_TE_DEVICE`) |
 
-構成は **VRAM 予算から自動で選びます**。既定(`H3IMG_VRAM_GB=auto`)は使う GPU の総容量を予算にし、
-ロード時の実際の空きがそれより小さければ空きの方を予算にします(他のプロセスが使っていても溢れない)。
+構成は **VRAM 予算から自動で選びます**。予算は「`H3IMG_VRAM_GB`(既定 `auto` = GPU の総容量)」と
+「ロード時の実際の空き − 予備 1GB(`H3IMG_VRAM_RESERVE_GB`、画面表示や他のアプリの分)」の小さい方です。
 `H3IMG_VRAM_GB=16` のように起動時に指定すれば、大きい GPU でも 16GB 級の構成で動かせます。
 
-| プロファイル | 構成 | 選ばれる条件(空き VRAM) | 実測 peak |
-|---|---|---|---|
-| `48gb` | int8wo、TE 常駐(最高速) | ≥ 40GB(TE が別 GPU なら ≥ 22.5GB) | 37〜38.4GB |
-| `32gb` | W4A8、TE 常駐 | ≥ 31.5GB(別 GPU なら ≥ 14.5GB) | 28.7〜30.2GB |
-| `16gb` | W4A8 + TE 層ストリーミング + VAE スワップ | ≥ 14.5GB | 12.5〜13.0GB(ホスト RAM 約 19GB) |
-| `8gb` | 上記 + transformer ブロックストリーミング | それ未満 | 2.4〜2.9GB(プロセス実使用 4.2GB)、ホスト RAM 約 29GB |
+| プロファイル | 構成 | 選ばれる条件(予算) | 実測 peak(torch) | 必須のホスト RAM |
+|---|---|---|---|---|
+| `48gb` | int8wo、TE 常駐(最高速) | ≥ 38.7GB(TE が別 GPU なら ≥ 21.7GB) | 37〜38.4GB | 2GB |
+| `32gb` | W4A8、TE 常駐 | ≥ 30.5GB(別 GPU なら ≥ 13.6GB) | 28.7〜30.2GB | 2.5GB |
+| `16gb` | W4A8 + TE 層ストリーミング + VAE スワップ | ≥ 13.3GB | 12.5〜13.0GB | 18.3GB(`mmap` なら 3.5GB) |
+| `8gb` | 上記 + transformer ブロックストリーミング | それ未満 | 2.4〜2.9GB(VAE を GPU に置くと +1.4GB) | 27.2GB(`mmap` なら 12.4GB) |
+
+ホスト RAM の `mmap` は text_encoder の原本をページキャッシュに置く設定で、搭載 RAM 48GB 未満の PC では既定で
+選ばれます([下記](#vram-の予備とram-の少ない-pc-向けの設定))。
 
 - GPU が 2 枚あれば TE は既定で 2 枚目に置きます(`H3IMG_TE_GPU`)。使う GPU は `H3IMG_GPU=1` のように番号で指定。
 - 生成中に CUDA OOM が起きたら(ロード後に他のプロセスが VRAM を取った等)、**一段下のプロファイルへ自動で下げて
@@ -161,7 +166,7 @@ H3IMG_GPU=0 H3IMG_TE_GPU=1 ./run.sh
 # 予算を指定: 96GB の GPU でも 16GB 級の構成(W4A8 + TE ストリーミング)で動かす
 H3IMG_VRAM_GB=16 ./run.sh
 
-# 8GB 級の構成を強制(ホスト RAM を約 29GB 使う)
+# 8GB 級の構成を強制(必須のホスト RAM は約 27GB、RAM 48GB 未満の PC では自動で mmap になり約 12GB)
 H3IMG_VRAM_GB=8 ./run.sh
 
 # 量子化だけ明示(予算より優先): W4A8 で TE は常駐(32GB 級の構成)
@@ -182,12 +187,12 @@ H3IMG_VRAM_FALLBACK=0 ./run.sh
 | `H3IMG_VRAM_RESERVE_GB` | 数値(既定 1.0) | 必ず空けておく VRAM(画面表示などの分) |
 | `H3IMG_TE_HOST` | `auto` / `pinned` / `mmap` | text_encoder の原本の置き場所(mmap は RAM 32GB の PC 向け) |
 
-| プロファイル | 量子化 | TE | transformer | 要る空き VRAM | 速度(1024² / 2048²) |
+| プロファイル | 量子化 | TE | transformer | 要る予算 | 速度(1024² / 2048²、TE は pinned) |
 |---|---|---|---|---|---|
-| `48gb` | int8wo | 常駐 | 常駐 | 40GB(TE が別 GPU なら 22.5GB) | 1.8s / 4.1s |
-| `32gb` | W4A8 | 常駐 | 常駐 | 31.5GB(別 GPU なら 14.5GB) | 0.7s / 2.8s |
-| `16gb` | W4A8 | ストリーミング | 常駐 | 14.5GB | 1.2s / 3.4s |
-| `8gb` | W4A8 | ストリーミング | ストリーミング | 5GB(実使用 4.2GB) | 1.8s / 3.5s |
+| `48gb` | int8wo | 常駐 | 常駐 | 38.7GB(TE が別 GPU なら 21.7GB) | 1.8s / 4.1s |
+| `32gb` | W4A8 | 常駐 | 常駐 | 30.5GB(別 GPU なら 13.6GB) | 0.7s / 2.8s |
+| `16gb` | W4A8 | ストリーミング | 常駐 | 13.3GB | 1.2s / 3.4s |
+| `8gb` | W4A8 | ストリーミング | ストリーミング | それ未満 | 1.8s / 3.5s |
 
 選ばれたプロファイルは起動ログ(`VRAM profile: ...`)、`/api/status` の `engine.profile`、ジョブ結果の `profile` で
 確認できます。`auto` の各項目は予算から決まり、明示した項目はそれより優先されます。
@@ -326,7 +331,8 @@ VRAM を減らす手段は「小さくする」「GPU に置かない」「使�
 その結果 8GB 構成でも 16GB 構成と同じ速度で、出力はピクセル単位で一致します。
 
 どの手段をどこまで使うかは VRAM 予算([起動例](#起動例gpuvram-予算量子化の指定))から自動で決めます。
-「置かない / 使う瞬間だけ置く」ものはホスト RAM に残るので、8GB 構成ではプロセスのホスト RAM 使用量が約 29GB になります。
+「置かない / 使う瞬間だけ置く」ものはホスト RAM に残るので、8GB 構成ではプロセスのホスト RAM 使用量が約 29GB になります
+(text_encoder をページキャッシュに置く `mmap` 設定なら必須分は約 12GB)。
 
 ### 1. AdaLN 射影を「事前計算テーブル」に置き換える(VRAM −26GB、誤差ゼロ)
 
@@ -458,7 +464,7 @@ GPU から外したものはホスト RAM に置きます。最初の実装は 8
 副次効果として、text_encoder の転送がピン留めのまま行われるようになり、16gb / 8gb 構成が速くなりました
 (1024² 2.6s → 1.2s / 1.8s、2048² 4.1〜4.2s → 3.4〜3.5s)。
 
-また、ロード時に PyTorch のアロケータが予約できる量を「VRAM 予算 − 1GB」に制限しています
+また、ロード時に PyTorch のアロケータが予約できる量を VRAM 予算までに制限しています
 (`torch.cuda.set_per_process_memory_fraction`)。ストリーミングで解放が遅れても、予算を超えて VRAM を抱え込みません。
 
 ### VRAM の予備と、RAM の少ない PC 向けの設定
@@ -574,7 +580,7 @@ VRAM 目的のみ。1024² では GPU より CPU 側のカーネル発行が律�
 ### 未検証
 
 - bf16 本体との品質比較(文字崩れの切り分け)、4096² 以上の VRAM・時間、複数参照(2 枚以上)の編集、
-  nf4 本体(24GB 級向け)、nvfp4 / W4A8 カーネル、CUDA Graph 化。
+  nvfp4、CUDA Graph 化、実物の 8〜32GB カードでの計測。
 
 ## 経緯
 
@@ -583,29 +589,4 @@ diffusers-movie-server(MiniMax-H3 動画 + LTX-2.5 の統合サーバ)の第 3 �
 
 ---
 
-### English summary
-
-Standalone server + browser UI for MiniMax-H3-Image (33B text-to-image / reference editing) running in
-~21GB of VRAM for the transformer plus ~17GB for the nf4 text encoder (ideally on a second GPU): the AdaLN
-projections (39% of the weights) are replaced by an exact precomputed table (the sampling timesteps are
-fixed), the remaining linears are torchao int8 weight-only, and the pDMD 2-step LoRA is merged for a 3-step
-default. Measured on an RTX PRO 6000: 1.8s @1024², 4.1s @2048², 6.7s for a 2048² reference edit.
-The configuration is picked automatically from a VRAM budget (`H3IMG_VRAM_GB`, default = the GPU's size capped by
-the actual free memory; on a CUDA OOM during generation it steps down one profile and retries). Low-VRAM profiles: the transformer linears become W4A8 (comfy-kitchen
-kernels, ~11GB, faster GEMM than int8) and the 51 text-encoder layers are streamed one at a time from pinned
-host RAM (resident ~0.3GB after dropping the unused lm_head and keeping the embedding table on CPU;
-bit-exact output), and the VAE is moved to the GPU only for encode/decode, so the whole model runs on a
-**single 32GB GPU (peak ~29GB) or a single 16GB GPU (peak 12.5–13.0GB, host RAM ~19GB)** at 1.2s @1024² /
-3.4s @2048² / 6.0s for a 1664×2496 reference edit. With `H3IMG_TRANSFORMER_STREAM=1` the 50 transformer blocks are
-also prefetched from pinned host RAM on a side stream (pixel-identical output, about the same speed), bringing the
-process footprint down to **4.2GB of VRAM, i.e. an 8GB GPU, with ~29GB of host RAM**. Host memory is pinned in place
-with cudaHostRegister (no allocator round-up) and weights are never copied back from the GPU (all verified on a 96GB
-GPU with free memory capped at 15.5GB / 7.3GB; real 8–32GB cards not tested yet).
-How: (1) the AdaLN projections only depend on the (fixed) sampling timesteps, so their outputs are
-precomputed into a 68MB table with bit-exact results (−26GB); (2) the remaining 312 linears are int8
-weight-only, quantized shard-by-shard without materializing bf16 (−21GB, 1.6× faster than bnb LLM.int8);
-(3) the Qwen3-VL-32B text encoder is nf4 and truncated to 51 layers (the model reads hidden_states[50]);
-(4) the pDMD LoRA makes 3 steps look like 6 (1.7×); (5) generating at the requested size instead of the
-4MP minimum canvas makes 1024² 2–3× faster. `scripts/prepare_models.py` downloads the model and the LoRA
-and builds the nf4 text encoder.
-**Code: MIT. Model weights and outputs: MiniMax-H3-Image Community License (see the model card).**
+English: see [README.en.md](README.en.md).
