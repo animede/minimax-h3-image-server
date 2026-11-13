@@ -124,6 +124,10 @@ see method 6 [below](#how-the-vram-was-reduced-and-the-speed-increased)).
 - Disk: the original model 64GB (HF cache) + LoRA 1.4GB + quantized text encoder 17GB + transformer cache 19GiB
   (int8wo) or 10.7GiB (ck-w4a8) per step count you use. **Creating the text encoder temporarily needs +66.7GB**
   (the bf16 source; `--delete-te-source` deletes it afterwards).
+- Model preparation (`prepare_models.py`) also runs with little VRAM: the text encoder is quantized to nf4 layer by
+  layer (0.3GB of VRAM, 1GB of RAM) and the transformer quantization cache is built with 2GB of VRAM and 3GB of RAM
+  even on the 6GB-class profile (measured under a 12GB RAM cap). **A PC with a 6GB GPU and 16GB of RAM can go from
+  download to generation on its own** (disk space permitting).
 
 ### Steps
 
@@ -133,7 +137,7 @@ uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 # without uv: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# Prepare the models (first time only: downloads the 64GB model + LoRA and quantizes the text encoder; needs a GPU)
+# Prepare the models (first time only: downloads the 64GB model + LoRA and quantizes the text encoder; needs a GPU, <1GB of VRAM)
 .venv/bin/python scripts/prepare_models.py --delete-te-source
 
 # Optional: build the transformer quantization cache in advance (otherwise built on the first generation)
@@ -442,6 +446,10 @@ RoPE) are left alone, following the model's own settings.
 The Qwen3-VL-32B used for conditioning has the same weights as MiniMax-H3 (video), and the model reads only
 `hidden_states[50]` (the output of the 51st layer). So it is loaded with `num_hidden_layers` set to 51 in the config
 (layers 51–63 and lm_head are discarded), quantized to bitsandbytes nf4, and saved.
+The quantization does not go through `from_pretrained(quantization_config=...)`: the bf16 shards are read from the
+mmap one tensor at a time, quantized on the GPU with `Params4bit`, and written as one safetensors file per layer
+(`app/te_quant.py`). The former loads the whole model onto the GPU and needs 17GB of VRAM; the latter needs 0.3GB of
+VRAM and 1GB of RAM, and the tensor values are bit-identical (verified).
 
 - With 50 layers the value would be taken after the final norm and the conditioning would change, so **51 layers is
   correct**.

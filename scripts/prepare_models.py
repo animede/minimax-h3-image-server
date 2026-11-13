@@ -6,7 +6,8 @@
   2. pDMD 2-step LoRA(akhaliq/minimax-h3-image-pdmd-2step、Apache-2.0、1.4GB)→ models/lora/
   3. 量子化済み text_encoder(Qwen3-VL-32B、bnb nf4・51 層)→ models/te/
      MiniMaxAI/MiniMax-H3 の text_encoder(66.7GB、H3-Image のものとビット一致)を落とし、
-     `num_hidden_layers=51` の config で nf4 ロードして保存する(17GB、GPU が必要)。
+     `num_hidden_layers=51` で層ごとに nf4 量子化して保存する(17GB。GPU は要るが VRAM は 1GB 未満、
+     RAM も 1GB 程度。6GB の GPU・16GB の RAM の PC でも作れる。ディスクは bf16 66.7GB + 17GB)。
      既に他のインストールにある場合は `--link-te <dir>` で symlink にできる。
   4. (任意)`--build-cache` で transformer の量子化キャッシュ(各 ~19GiB)を先に作る。
      省略すると初回生成時に自動構築される(約 40 秒)。
@@ -37,6 +38,11 @@ TE_REPO = "MiniMaxAI/MiniMax-H3"
 LORA_REPO = "akhaliq/minimax-h3-image-pdmd-2step"
 LORA_SRC_FILE = "lora_model_0.safetensors"
 TEXT_ENCODER_LAYER = 50  # hidden_states[50] を読む → 51 層あればよい
+
+
+import logging  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 
 def log(msg: str) -> None:
@@ -91,29 +97,15 @@ def build_text_encoder(delete_source: bool) -> None:
         return
     import torch
     from huggingface_hub import snapshot_download
-    from transformers import AutoConfig, AutoModelForImageTextToText, BitsAndBytesConfig
 
     if not torch.cuda.is_available():
         raise SystemExit("text_encoder の nf4 量子化には GPU が必要です(--link-te で既存を参照することもできます)")
     t0 = time.time()
     src = snapshot_download(TE_REPO, allow_patterns=["text_encoder/*"])
     log(f"TE ソース(bf16 66.7GB): {src}({time.time() - t0:.0f}s)")
-    cfg = AutoConfig.from_pretrained(src, subfolder="text_encoder")
-    # MiniMax-H3 は hidden_states[50] しか読まない。51 層で止める(50 層にすると最終 norm 後の
-    # 値になってしまい条件付けが変わる。層 51〜63 と lm_head は読み込まれず捨てられる)。
-    cfg.text_config.num_hidden_layers = TEXT_ENCODER_LAYER + 1
-    t0 = time.time()
-    te = AutoModelForImageTextToText.from_pretrained(
-        src, subfolder="text_encoder", config=cfg, dtype=torch.bfloat16, device_map="cuda",
-        quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                                               bnb_4bit_compute_dtype=torch.bfloat16),
-    )
-    log(f"nf4 ロード: {time.time() - t0:.0f}s(GPU {torch.cuda.memory_allocated() / 2**30:.1f}GB)")
-    tmp = dst.with_name(dst.name + ".tmp")
-    if tmp.exists():
-        shutil.rmtree(tmp)
-    te.save_pretrained(str(tmp))
-    tmp.rename(dst)
+    # 層ごとに量子化して書き出す(VRAM 約 0.3GB・RAM 約 1GB。モデル全体を GPU に載せる方式だと VRAM 17GB が要る)
+    from app import te_quant
+    te_quant.build(Path(src) / "text_encoder", dst, TEXT_ENCODER_LAYER + 1, torch.device("cuda"), log=log)
     size = sum(p.stat().st_size for p in dst.rglob("*") if p.is_file()) / 2**30
     log(f"text_encoder 保存: {dst}({size:.1f}GiB)")
     if delete_source:

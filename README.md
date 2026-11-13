@@ -115,6 +115,9 @@ int8wo と同程度です。品質は同一 seed で int8wo と並べて目視�
 - ディスク: 本家モデル 64GB(HF キャッシュ)+ LoRA 1.4GB + 量子化済み text_encoder 17GB +
   transformer キャッシュ 19GiB(int8wo)または 10.7GiB(ck-w4a8)× 使うステップ種。
   **text_encoder の作成時のみ一時的に +66.7GB**(bf16 ソース。`--delete-te-source` で作成後に削除可)
+- モデルの準備(`prepare_models.py`)も低 VRAM で動きます: text_encoder の nf4 量子化は層ごとに行い VRAM 0.3GB・RAM 1GB、
+  transformer の量子化キャッシュ構築は 6GB 級でも VRAM 2GB・RAM 3GB(RAM 12GB 上限で実測)。
+  **6GB の GPU・16GB の RAM の PC だけで、ダウンロードから生成まで完結します**(ディスクは必要)
 
 ### 手順
 
@@ -124,7 +127,7 @@ uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 # uv を使わない場合: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# モデル類の準備(初回のみ。本家モデル 64GB + LoRA のダウンロードと text_encoder の量子化。GPU が必要)
+# モデル類の準備(初回のみ。本家モデル 64GB + LoRA のダウンロードと text_encoder の量子化。GPU が必要、VRAM は 1GB 未満)
 .venv/bin/python scripts/prepare_models.py --delete-te-source
 
 # 任意: transformer の量子化キャッシュを先に作っておく(省略すると初回生成時に自動構築)
@@ -420,6 +423,10 @@ attention と FF の Linear 312 層(50 ブロック × 6 + token refiner 2 × 6)
 条件付けに使う Qwen3-VL-32B は MiniMax-H3(動画)と同一の重みで、モデルは `hidden_states[50]`
 (51 層目の出力)しか読みません。そこで config の `num_hidden_layers` を 51 にしてロードし
 (層 51〜63 と lm_head は捨てる)、bitsandbytes nf4 で量子化して保存します。
+量子化は `from_pretrained(quantization_config=...)` ではなく、bf16 のシャードを mmap から 1 テンソルずつ読んで
+`Params4bit` で GPU 上で量子化し、層ごとに 1 ファイルの safetensors へ書き出します(`app/te_quant.py`)。
+前者はモデル全体を GPU に載せるので VRAM 17GB が要りますが、後者は VRAM 0.3GB・RAM 1GB で済み、
+テンソルの値は前者とビット一致します(検証済み)。
 
 - 50 層にすると最終 norm 後の値になって条件付けが変わるため、**51 層が正解**です。
 - エンコードは 1 回 0.1〜0.5 秒しか掛からないので、速度への影響はほぼありません。

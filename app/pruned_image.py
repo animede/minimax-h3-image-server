@@ -613,8 +613,11 @@ def load_lora_pairs(lora_path: str) -> tuple[dict[str, tuple[torch.Tensor, torch
 
 def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: bool = True,
                 quant: str = "int8wo", lora_path: str | None = None, stream_blocks: bool = False,
-                pin_blocks: bool = True, drop_blocks: str = "auto"):
+                pin_blocks: bool = True, drop_blocks: str = "auto", spill_dir: Path | None = None):
     """bf16 シャードから量子化済み transformer を組み立てる(1 テンソルずつ GPU へ)。
+
+    spill_dir(stream_blocks のとき): 量子化の済んだブロックをその場で safetensors に書き出し、以後は
+    そのファイルの mmap を参照する(RAM に 11GB 溜めない。RAM 16GB の PC でもキャッシュを作れる)。
 
     quant="int8wo": torchao Int8WeightOnly(キャッシュ可。eager では bf16 へ逆量子化してから
     GEMM するため bnb より遅い、2026-11-11 実測)。
@@ -659,6 +662,22 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
     n_quant = 0
     modules = dict(tr.named_modules())
     verified = False
+    remaining: dict[int, int] = {}      # ブロック番号 → まだ処理していない(AdaLN / 量子化対象)テンソルの数
+    for name in index:
+        if name.startswith("transformer_blocks.") and ("adaln_proj" in name or _is_quant_target(name)):
+            bi = int(name.split(".")[1])
+            remaining[bi] = remaining.get(bi, 0) + 1
+    if spill_dir is not None and stream_blocks:
+        spill_dir.mkdir(parents=True, exist_ok=True)
+
+    def block_done(name: str) -> None:
+        if not name.startswith("transformer_blocks."):
+            return
+        bi = int(name.split(".")[1])
+        remaining[bi] -= 1
+        if remaining[bi] == 0 and spill_dir is not None and stream_blocks:
+            _spill_block(tr.transformer_blocks[bi], spill_dir / f"block-{bi:02d}.safetensors")
+
     for shard, names in by_shard.items():
         with safe_open(str(sub / shard), framework="pt", device="cpu") as f:
             for name in names:
@@ -680,6 +699,8 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
                         tab = AdaLNTable(keys.clone(), table, hidden)
                         _replace_adaln(tr, bi, tab.to("cpu") if stream_blocks else tab)
                         del pending_adaln[bi], slot
+                        block_done(name)
+                        block_done(name.replace(".bias", ".weight") if name.endswith(".bias") else name.replace(".weight", ".bias"))
                 elif _is_quant_target(name):
                     mod_name = name.rsplit(".", 1)[0]
                     w = f.get_tensor(name)
@@ -700,19 +721,19 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
                         _assign(tr, name, device, w)
                         quantize_(modules[mod_name], cfg)
                     n_quant += 1
+                    block_done(name)
                 else:
                     continue
     assert not pending_adaln, f"AdaLN の重みが揃わないブロック: {sorted(pending_adaln)}"
-    # init_empty_weights はパラメータだけを meta にし、バッファ(rope.inv_freq)は CPU に残す。
+    # init_empty_weights はパラメータだけを meta にし、非永続バッファ(rope.inv_freq)は CPU に残すので GPU へ移す。
+    # state_dict に入るバッファ(ブロックの量子化重み・AdaLN テーブル。stream_blocks のとき CPU に置いてある)は触らない。
+    persistent = set(tr.state_dict().keys())
     for name, buf in list(tr.named_buffers()):
-        if buf.device != device:
+        if buf.device != device and name not in persistent:
             mod_name, _, attr = name.rpartition(".")
             dict(tr.named_modules())[mod_name].register_buffer(attr, buf.to(device), persistent=False)
     if stream_blocks:
-        paths = [cache_dir / STATE_FILENAME_ST] if file_blocks and (cache_dir / STATE_FILENAME_ST).exists() else None
-        if file_blocks and paths is None:
-            logger.warning("このキャッシュは safetensors ではないので file streaming は使えません(mmap で続行)")
-        install_block_streaming(tr, device, pin=pin_blocks, drop_blocks=drop_blocks, file_paths=paths)
+        install_block_streaming(tr, device, pin=pin_blocks, drop_blocks=drop_blocks)
     torch.cuda.empty_cache()
     install_forward_wrapper(tr)
     tr.eval()
@@ -724,12 +745,28 @@ def build_fresh(repo: str, device: torch.device, keys: torch.Tensor, verify: boo
     return tr
 
 
+def _spill_block(block: nn.Module, path: Path) -> None:
+    """ブロックの重みを safetensors に書き、テンソルをそのファイルの mmap に差し替える(匿名メモリを解放する)。"""
+    from safetensors.torch import load_file, save_file
+
+    sd = {k: v.detach().cpu().contiguous() for k, v in block.state_dict().items()}
+    save_file(sd, str(path))
+    del sd
+    block.load_state_dict(load_file(str(path), device="cpu"), assign=True)
+
+
 def save_cache(tr, cache_dir: Path) -> None:
     tmp = cache_dir.with_name(cache_dir.name + ".tmp")
     tmp.mkdir(parents=True, exist_ok=True)
     tr.save_config(str(tmp))
     sd = {k: v.detach().cpu() for k, v in tr.state_dict().items()}
-    _save_state(sd, tmp)
+    out = _save_state(sd, tmp)
+    del sd
+    if out.name == STATE_FILENAME_ST:
+        # ビルド中に書き出したブロック単位のファイル(mmap で参照中)を本体に差し替えてから消す
+        tr.load_state_dict(_load_state(tmp), assign=True)
+        for p in sorted(tmp.glob("block-*.safetensors")):
+            p.unlink()
     if cache_dir.exists():
         import shutil
         shutil.rmtree(cache_dir)
@@ -832,7 +869,8 @@ def load_transformer(repo: str, pipe, device: torch.device, cache_dir: Path, qua
                                f"{cache_dir} を削除して作り直してください")
         return tr
     tr = build_fresh(repo, device, keys, verify=True, quant=quant, lora_path=lora_path,
-                     stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks)
+                     stream_blocks=stream_blocks, pin_blocks=pin_blocks, drop_blocks=drop_blocks,
+                     spill_dir=cache_dir.with_name(cache_dir.name + ".tmp"))
     save_cache(tr, cache_dir)
     return tr
 
