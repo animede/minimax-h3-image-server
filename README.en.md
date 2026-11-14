@@ -279,7 +279,9 @@ API (asynchronous jobs):
 | POST | `/api/prompts/enhance` | Prompt enhancement (see below) |
 | POST | `/api/interrupt` | `{job_id?}` interrupt |
 | POST | `/api/admin/unload` / `/api/admin/load` | Free VRAM (keep the process) / explicit load (`{steps}`) |
-| GET | `/api/health` / `/api/status` | Status |
+| GET | `/api/health` / `/api/status` | Status. `llm` in `/api/status` reports the prompt-enhancement LLM's connection state (`configured` / `ok` / `detail` / `latency_ms` / `models`, cached 30 s) |
+| DELETE | `/api/assets/{id}` | Delete an uploaded reference image (called by the UI's × / "clear all"; 409 while a queued or running job uses it) |
+| GET | `/api/llm/check` | Check the LLM now (`GET <base_url>/models`, bypassing the cache); the UI's "LLM 確認" link |
 
 ```json
 {"mode": "t2i" | "edit", "prompt": "...", "width": 2048, "height": 2048, "seed": 42,

@@ -111,6 +111,11 @@ class JobManager:
     def active_ids(self) -> list[str]:
         return [j.id for j in self.jobs.values() if j.status in ("queued", "running")]
 
+    def asset_in_use(self, asset_id: str) -> bool:
+        """待機中・実行中のジョブが参照しているアセットか(削除を拒否するため)。"""
+        return any(c.asset_id == asset_id for j in self.jobs.values()
+                   if j.status in ("queued", "running") for c in j.request.conditions)
+
     def _asset_path(self, asset_id: str):
         for p in self.s.input_dir.glob(asset_id + ".*"):
             return p

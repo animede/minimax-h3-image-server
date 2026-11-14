@@ -4,6 +4,7 @@ API(非同期ジョブ方式。diffusers-movie-server のバックエンド版�
   GET  /api/health           {status, model, loaded, ...}
   GET  /api/status           health + engine 状態 + busy
   POST /api/assets           参照画像アップロード → {id, kind, filename, size}
+  DELETE /api/assets/{id}    アップロードした参照画像を削除(実行中のジョブが使っていれば 409)
   POST /api/jobs             生成ジョブ投入(202)→ JobResponse
   GET  /api/jobs?limit=N     履歴(新しい順)
   GET  /api/jobs/{id}        ジョブ状態
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -73,7 +75,14 @@ def health():
 def status():
     return {**health(), "engine": engine.status(), "busy": bool(manager.active_ids()),
             "default_steps": settings.default_steps, "steps_available": sorted(STEP_PRESETS),
-            "default_generation_area": settings.default_generation_area}
+            "default_generation_area": settings.default_generation_area,
+            "llm": enhancer.probe()}
+
+
+@app.get("/api/llm/check")
+def llm_check():
+    """プロンプト拡張用 LLM の疎通確認(キャッシュを使わず今すぐ叩く)。GUI の「LLM 確認」ボタン用。"""
+    return enhancer.probe(force=True)
 
 
 @app.post("/api/assets", response_model=AssetResponse, status_code=201)
@@ -161,6 +170,21 @@ class EnhanceRequest(BaseModel):
     mode: str = "t2i"                       # t2i | edit(それ以外は t2i 扱い)
     conditions: list[ConditionInput] = []   # edit: 参照画像(アップロード順 = <Picture N>)
     aspect_ratio: Optional[str] = None      # edit: "W:H" を指定すると固定、省略で adaptive
+
+
+@app.delete("/api/assets/{asset_id}")
+def delete_asset(asset_id: str):
+    """アップロードした参照画像を 1 件削除する。待機中・実行中のジョブが使っていれば 409。
+    (完了したジョブは入力を参照し続けないので削除してよい。UI の × ボタンが呼ぶ。)"""
+    if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
+        raise HTTPException(status_code=400, detail="asset_id は 32 桁の16進です")
+    path = manager._asset_path(asset_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="アセットが見つかりません")
+    if manager.asset_in_use(asset_id):
+        raise HTTPException(status_code=409, detail="実行中または待機中のジョブが使っている参照画像です")
+    path.unlink(missing_ok=True)
+    return {"deleted": asset_id}
 
 
 @app.post("/api/prompts/enhance")

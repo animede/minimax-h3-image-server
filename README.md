@@ -268,7 +268,9 @@ API(非同期ジョブ方式):
 | DELETE | `/api/jobs/{id}` / `/api/outputs/{file}` | 履歴削除(実行中なら中断)/ 生成物削除 |
 | POST | `/api/interrupt` | `{job_id?}` 中断 |
 | POST | `/api/admin/unload` / `/api/admin/load` | VRAM 解放(プロセス温存)/ 明示ロード(`{steps}`) |
-| GET | `/api/health` / `/api/status` | 状態 |
+| GET | `/api/health` / `/api/status` | 状態。`/api/status` の `llm` にプロンプト拡張用 LLM の接続状態(`configured` / `ok` / `detail` / `latency_ms` / `models`、30 秒キャッシュ) |
+| DELETE | `/api/assets/{id}` | アップロードした参照画像を削除(UI の × / 「参照をすべて取り消す」が呼ぶ。実行中・待機中のジョブが使っていれば 409) |
+| GET | `/api/llm/check` | LLM の疎通確認(キャッシュを使わず今すぐ `GET <base_url>/models` を叩く)。UI の「LLM 確認」 |
 
 ```json
 {"mode": "t2i" | "edit", "prompt": "...", "width": 2048, "height": 2048, "seed": 42,

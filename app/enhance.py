@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import re
+import time
 from fractions import Fraction
 from pathlib import Path
 
@@ -77,6 +78,52 @@ class PromptEnhancer:
     @property
     def available(self) -> bool:
         return bool(self.s.llm_base_url and self.s.llm_model)
+
+    # -- 疎通確認 ----------------------------------------------------------------
+
+    _probe_cache: dict | None = None
+    _probe_at: float = 0.0
+    PROBE_CACHE_S = 30.0
+
+    def probe(self, force: bool = False) -> dict:
+        """LLM の接続状態。`GET <base_url>/models` を短いタイムアウトで叩き、設定の有無・到達可否・
+        エラー内容を返す(GUI と /api/status 用)。status のポーリングで LLM を叩き続けないよう 30 秒キャッシュ。"""
+        now = time.time()
+        if not force and self._probe_cache is not None and now - self._probe_at < self.PROBE_CACHE_S:
+            return self._probe_cache
+        info: dict = {"configured": self.available, "base_url": self.s.llm_base_url, "model": self.s.llm_model,
+                      "api_key": bool(self.s.llm_api_key), "ok": False, "detail": "", "models": []}
+        if not self.available:
+            info["detail"] = "未設定(H3IMG_LLM_BASE_URL / H3IMG_LLM_MODEL)"
+        else:
+            headers = {"Authorization": f"Bearer {self.s.llm_api_key}"} if self.s.llm_api_key else {}
+            url = self.s.llm_base_url.rstrip("/") + "/models"
+            t0 = time.time()
+            try:
+                with httpx.Client(timeout=5.0) as client:
+                    res = client.get(url, headers=headers)
+                info["latency_ms"] = round((time.time() - t0) * 1000)
+                if res.status_code == 200:
+                    try:
+                        names = [m.get("id") or m.get("name") for m in res.json().get("data", [])]
+                    except ValueError:
+                        names = []
+                    info["models"] = [n for n in names if n]
+                    info["ok"] = True
+                    if info["models"] and self.s.llm_model not in info["models"]:
+                        info["detail"] = (f"接続OK。ただしサーバーのモデル一覧に {self.s.llm_model!r} が無い"
+                                          f"(一覧: {', '.join(info['models'][:5])})")
+                    else:
+                        info["detail"] = "接続OK"
+                elif res.status_code in (401, 403):
+                    info["detail"] = f"HTTP {res.status_code}: 鍵が拒否された(H3IMG_LLM_API_KEY を確認)"
+                else:
+                    info["detail"] = f"HTTP {res.status_code}: {res.text[:120]}"
+            except httpx.HTTPError as exc:
+                info["detail"] = f"接続できない: {exc.__class__.__name__}: {str(exc)[:120]}"
+        info["checked_at"] = now
+        self._probe_cache, self._probe_at = info, now
+        return info
 
     # -- 公式ルール文書 ----------------------------------------------------------
 
