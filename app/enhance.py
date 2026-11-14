@@ -101,7 +101,7 @@ class PromptEnhancer:
                 where = f".env が見つかりません(置き場所: {BASE_DIR / '.env'})"
             else:
                 where = f"{DOTENV_STATUS['path']} を読みました(キー: {', '.join(DOTENV_STATUS['keys']) or 'なし'})"
-            info["detail"] = f"未設定: {' / '.join(missing)} が空。{where}"
+            info["detail"] = f"{' / '.join(missing)} が空。{where}"
         else:
             headers = {"Authorization": f"Bearer {self.s.llm_api_key}"} if self.s.llm_api_key else {}
             url = self.s.llm_base_url.rstrip("/") + "/models"

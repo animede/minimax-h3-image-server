@@ -62,7 +62,8 @@ def _startup():
 
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse(BASE_DIR / "static" / "index.html")
+    # 画面を更新したときにブラウザのキャッシュで古い HTML が残らないように
+    return FileResponse(BASE_DIR / "static" / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/health")

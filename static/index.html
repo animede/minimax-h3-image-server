@@ -302,7 +302,7 @@ function renderLlm(llm) {
   const el = $("llm-status");
   if (!llm) { el.textContent = ""; return; }
   const where = llm.base_url ? llm.base_url.replace(/^https?:\/\//, "").replace(/\/v1\/?$/, "") : "";
-  if (!llm.configured) { el.textContent = "LLM: 未設定"; el.style.color = "#c66"; return; }
+  if (!llm.configured) { el.textContent = "LLM: 未設定" + (llm.detail ? " — " + llm.detail : ""); el.style.color = "#c66"; return; }
   const lat = llm.latency_ms != null ? " " + llm.latency_ms + "ms" : "";
   el.textContent = (llm.ok ? "LLM: 接続OK " : "LLM: NG ") + llm.model + " @ " + where + lat + (llm.ok && llm.detail === "接続OK" ? "" : " — " + llm.detail);
   el.style.color = llm.ok ? (llm.detail === "接続OK" ? "#6a6" : "#c93") : "#c66";
