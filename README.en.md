@@ -645,7 +645,8 @@ pinned configuration:
   cannot use the mem-efficient kernel either, so it falls back to the math kernel and materializes the full score
   matrix (tokens² × 64 heads). An edit with two 1024² references needs a single 1.02GiB allocation there and ran out
   of memory on an RTX 3050 (log from the real machine). Disabling flash on Linux reproduces the same allocation at
-  the same place, and chunking makes it pass (peak 2.94GB). Chunking changes the bf16 summation order, so images are
+  the same place, and chunking makes it pass (peak 2.94GB). **Confirmed fixed on the real Windows RTX 3050 6GB**:
+  two 1024² references → 1024² in 73.7 s (TE peak 1.91GB), three in 120 s (TE peak 2.17GB). Chunking changes the bf16 summation order, so images are
   not pixel-identical to the Linux default (about 3/255 mean difference).
 - The `file` staging buffers are ordinary memory pinned with `cudaHostRegister`, not `pin_memory()` (cudaHostAlloc):
   the latter is charged to the cgroup as "file" memory, which escaped the page-cache budget (it subtracts anonymous

@@ -605,7 +605,8 @@ NVMe は Gen4 で連続読み 2.3GB/s、予備 1GB、出力は pinned 構成と�
   Windows で 512、他は 0)。Windows の PyTorch には flash attention のカーネルが無く、Qwen3-VL の GQA 付き SDPA は
   mem-efficient カーネルも使えず math カーネルに落ちて、スコア行列(トークン数² × 64 ヘッド)を丸ごと確保します。
   参照画像 2 枚(1024²)の編集で 1.02GiB の単発アロケーションになり、RTX 3050 では TE の中で OOM しました(実機ログ)。
-  Linux で flash を無効にすると同じ場所・同じ大きさで再現し、分割すると通ります(peak 2.94GB)。分割すると bf16 の
+  Linux で flash を無効にすると同じ場所・同じ大きさで再現し、分割すると通ります(peak 2.94GB)。
+  **Windows 実機(RTX 3050 6GB)でも解消を確認**: 1024² の参照 2 枚 → 1024² が 73.7s(TE peak 1.91GB)、3 枚が 120s(TE peak 2.17GB)。分割すると bf16 の
   計算順序が変わるので、Linux の既定(flash)とは画像が完全一致しません(平均 3/255 程度)。
 - `file` の受け皿(staging)は `pin_memory()`(cudaHostAlloc)ではなく、普通のメモリを `cudaHostRegister` でピン留め
   します。前者は cgroup に "file" として計上され、ページキャッシュの予算計算(匿名メモリを差し引く)から漏れて
