@@ -64,6 +64,10 @@ class Settings:
     # 1 にすると text_encoder のビジョン塔(ViT)を参照画像 1 枚ずつ通す(中間テンソルが最大 1 枚分で済む)。
     # 結果は一括処理と数値的に同一ではない(bf16 の計算順序の差が拡散で増幅され、画像で平均 3/255 程度)ので既定は 0
     vision_per_image: bool = _env("H3IMG_VISION_PER_IMAGE", "0") == "1"
+    # text_encoder の attention をクエリ何行ずつに分けて計算するか(0 = 分けない)。Windows の PyTorch は flash attention が
+    # 無く、因果マスク付き SDPA が math カーネルに落ちてスコア行列(トークン数²)を丸ごと確保するため、参照画像 2 枚の
+    # 編集で 6GB カードが OOM した(実測)。auto = Windows なら 512、それ以外は 0(flash / mem-efficient が使えるので不要)
+    te_attn_chunk: str = _env("H3IMG_TE_ATTN_CHUNK", "auto")
     models_dir: Path = Path(_env("H3IMG_MODELS_DIR", str(BASE_DIR / "models")))
     # 使う GPU: H3IMG_GPU=1 のように番号で指定(H3IMG_DEVICE=cuda:1 と同じ)。TE は H3IMG_TE_GPU / H3IMG_TE_DEVICE。
     # 既定: transformer は cuda:0、TE は GPU が 2 枚以上あれば cuda:1(engine 側で解決)

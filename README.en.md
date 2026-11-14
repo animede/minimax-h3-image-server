@@ -372,6 +372,7 @@ are fetched into `models/prompts/` from the PE repository and GitHub on first us
 | `H3IMG_TE_HOST` | auto | Text-encoder weights: `pinned` (fast, ~13GB of RAM) / `file` (each layer read straight from the file; for PCs with little RAM, any OS) / `mmap` (page cache + madvise, Linux only). auto = pinned with ≥48GB of RAM, otherwise file |
 | `H3IMG_TRANSFORMER_HOST` | auto | Transformer blocks (8gb profile): `pinned` (~10GB of RAM) / `file` or `mmap` (streamed from the quantization cache's page cache, overflow re-read from disk; for PCs with 16GB of RAM). auto follows the TE rule |
 | `H3IMG_TRANSFORMER_DROP_BLOCKS` | auto | With `file` / `mmap`, how many trailing blocks to re-read (file) or drop (mmap) after use. auto = only the overflow that does not fit in RAM; 0 = never |
+| `H3IMG_TE_ATTN_CHUNK` | auto | Query rows per chunk for the text encoder's attention (0 = no chunking). auto = 512 on Windows, 0 elsewhere. For environments without flash attention where edits with references OOM in the TE |
 | `H3IMG_REFERENCE_MAX_MEGAPIXELS` | auto | Per-reference pixel cap for edits (MP; smaller images are not upscaled). auto = 1.05 on the 8gb / 16gb profiles, no cap otherwise; 0 = no cap |
 | `H3IMG_KEEP_SOURCE` | 0 | Set to 1 to keep the transformer bf16 shards downloaded one by one during the cache build (files that were already present are never deleted either way) |
 | `H3IMG_GENERATION_AREA` | requested | Default canvas (`native` = at least 4MP) |
@@ -639,6 +640,13 @@ pinned configuration:
   256×524 / 679×662 in 13.5 s @1024² and 20.2 s @2048², three 400×1600 in 18.2 s / 27.8 s, three 3840×2160 through
   2048², all at a 2.9GB peak. The 32gb / 48gb profiles keep the official behaviour (no cap), so the same references
   give different results than on the 8gb / 16gb profiles.
+- **On Windows the text encoder's attention is computed in query chunks of 512 rows** (`H3IMG_TE_ATTN_CHUNK`,
+  auto = 512 on Windows, 0 elsewhere). PyTorch on Windows has no flash-attention kernel, and Qwen3-VL's GQA SDPA
+  cannot use the mem-efficient kernel either, so it falls back to the math kernel and materializes the full score
+  matrix (tokens² × 64 heads). An edit with two 1024² references needs a single 1.02GiB allocation there and ran out
+  of memory on an RTX 3050 (log from the real machine). Disabling flash on Linux reproduces the same allocation at
+  the same place, and chunking makes it pass (peak 2.94GB). Chunking changes the bf16 summation order, so images are
+  not pixel-identical to the Linux default (about 3/255 mean difference).
 - The `file` staging buffers are ordinary memory pinned with `cudaHostRegister`, not `pin_memory()` (cudaHostAlloc):
   the latter is charged to the cgroup as "file" memory, which escaped the page-cache budget (it subtracts anonymous
   memory) and pushed the transformer out of the cache (re-reads rose to 28GB in measurements).

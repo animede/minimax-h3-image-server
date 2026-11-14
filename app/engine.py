@@ -13,6 +13,7 @@ from __future__ import annotations
 import functools
 from dataclasses import dataclass
 import logging
+import os
 import threading
 import sys
 import time
@@ -179,6 +180,20 @@ class Engine:
         te = AutoModelForImageTextToText.from_pretrained(str(self.s.te_dir), dtype=torch.bfloat16,
                                                          device_map="cpu" if stream else str(self.te_device))
         self._keep_only_layer_output(te)
+        sdp_debug = os.environ.get("H3IMG_SDP_DEBUG", "")
+        if sdp_debug:
+            # デバッグ用: Linux で Windows の SDPA を模擬する。"noflash" = flash と cuDNN を無効(Windows 相当。
+            # mem-efficient は残る)、"math" = math カーネルのみ
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_cudnn_sdp(False)
+            if sdp_debug == "math":
+                torch.backends.cuda.enable_mem_efficient_sdp(False)
+            logger.warning("H3IMG_SDP_DEBUG=%s: SDPA のカーネルを制限(Windows の模擬)", sdp_debug)
+        chunk = (512 if sys.platform == "win32" else 0) if self.s.te_attn_chunk == "auto" else int(self.s.te_attn_chunk)
+        if chunk > 0:
+            from . import attention
+            attention.enable(te, chunk)
+            logger.info("text_encoder attention: query-chunked SDPA (%d rows per chunk)", chunk)
         if self.s.vision_per_image:
             self._vision_per_image(te)
         else:
