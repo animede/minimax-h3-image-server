@@ -94,7 +94,14 @@ class PromptEnhancer:
         info: dict = {"configured": self.available, "base_url": self.s.llm_base_url, "model": self.s.llm_model,
                       "api_key": bool(self.s.llm_api_key), "ok": False, "detail": "", "models": []}
         if not self.available:
-            info["detail"] = "未設定(H3IMG_LLM_BASE_URL / H3IMG_LLM_MODEL)"
+            from .config import BASE_DIR, DOTENV_STATUS
+
+            missing = [n for n, v in (("H3IMG_LLM_BASE_URL", self.s.llm_base_url), ("H3IMG_LLM_MODEL", self.s.llm_model)) if not v]
+            if DOTENV_STATUS["path"] is None:
+                where = f".env が見つかりません(置き場所: {BASE_DIR / '.env'})"
+            else:
+                where = f"{DOTENV_STATUS['path']} を読みました(キー: {', '.join(DOTENV_STATUS['keys']) or 'なし'})"
+            info["detail"] = f"未設定: {' / '.join(missing)} が空。{where}"
         else:
             headers = {"Authorization": f"Bearer {self.s.llm_api_key}"} if self.s.llm_api_key else {}
             url = self.s.llm_base_url.rstrip("/") + "/models"

@@ -28,16 +28,28 @@ TEXT_ENCODER_LAYER = 50   # MiniMax-H3 は Qwen3-VL の hidden_states[50] を読
 LORA_FILENAME = "minimax_h3_image_pdmd_2step_lora.safetensors"
 
 
+DOTENV_STATUS = {"path": None, "keys": []}   # 読んだ .env の場所とキー(状態表示用)
+
+
 def _load_dotenv(path: Path) -> None:
-    """`.env`(KEY=VALUE、# コメント)を環境変数へ(既存の環境変数が優先)。"""
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    """`.env`(KEY=VALUE、# コメント)を環境変数へ(既存の環境変数が優先)。
+
+    Windows のメモ帳が付ける UTF-8 の BOM(1 行目のキーが見えなくなる)と、拡張子が隠れて `.env.txt` に
+    なってしまう事故の両方を受け付ける(2026-11-15、実機で「未設定」になった件)。"""
+    candidates = [path, path.with_name(path.name + ".txt")]
+    for candidate in candidates:
+        if not candidate.exists():
             continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        for line in candidate.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip().lstrip("\ufeff")
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip().lstrip("\ufeff")
+            os.environ.setdefault(k, v.strip().strip('"').strip("'"))
+            DOTENV_STATUS["keys"].append(k)
+        DOTENV_STATUS["path"] = str(candidate)
+        return
 
 
 _load_dotenv(BASE_DIR / ".env")
