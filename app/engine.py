@@ -179,6 +179,10 @@ class Engine:
         te = AutoModelForImageTextToText.from_pretrained(str(self.s.te_dir), dtype=torch.bfloat16,
                                                          device_map="cpu" if stream else str(self.te_device))
         self._keep_only_layer_output(te)
+        if self.s.vision_per_image:
+            self._vision_per_image(te)
+        else:
+            self._track_vision_peak(te)
         if self.te_device != self.device:
             self._route_text_encoder(te)
         elif stream:
@@ -322,15 +326,67 @@ class Engine:
         layer.register_forward_hook(hook)
         n = TEXT_ENCODER_LAYER
 
+        engine = self
+        dev = self.te_device
+
         def forward(*args, **kwargs):
             kwargs["output_hidden_states"] = False
+            torch.cuda.reset_peak_memory_stats(dev)
             try:
                 orig(*args, **kwargs)
             except captured as c:
+                engine._te_peak_gb = torch.cuda.max_memory_allocated(dev) / 2**30
+                if engine.te_streamed:
+                    torch.cuda.empty_cache()   # 断片化対策(Windows は expandable_segments が使えない)
                 return _HiddenOnly(tuple([None] * n + [c.hidden]))
             raise RuntimeError(f"text_encoder の {n} 番目の層が呼ばれませんでした(層数の設定を確認)")
 
         inner.forward = forward
+
+    _te_peak_gb: float = 0.0
+    _vision_peak_gb: float = 0.0
+
+    def _track_vision_peak(self, te) -> None:
+        """ビジョン塔の通過直後の VRAM ピークを記録する(内訳ログ用)。"""
+        visual = te.model.visual
+        orig = visual.forward
+        engine = self
+        dev = self.te_device
+
+        def forward(*args, **kwargs):
+            out = orig(*args, **kwargs)
+            engine._vision_peak_gb = torch.cuda.max_memory_allocated(dev) / 2**30
+            return out
+
+        visual.forward = forward
+
+    def _vision_per_image(self, te) -> None:
+        """ビジョン塔(ViT)を参照画像 1 枚ずつ通す。transformers は全画像のパッチを 1 本に連結して通すため、
+        中間テンソル(MLP・LayerNorm・マスク)が枚数分まとめて確保される。1 枚ずつなら最大 1 枚分で済み、
+        結果は同じ(attention はもともと画像ごとに分かれている)。"""
+        visual = te.model.visual
+        orig = visual.forward
+        engine = self
+        dev = self.te_device
+
+        def forward(hidden_states, grid_thw, **kwargs):
+            if grid_thw.shape[0] <= 1:
+                out = orig(hidden_states, grid_thw, **kwargs)
+                engine._vision_peak_gb = torch.cuda.max_memory_allocated(dev) / 2**30
+                return out
+            kw = {k: v for k, v in kwargs.items() if not (k.startswith("cu_seq") or k.startswith("max_seqlen") or k.startswith("max_length"))}
+            sizes = grid_thw.prod(-1).tolist()
+            outs = [orig(chunk, grid_thw[i:i + 1], **kw)
+                    for i, chunk in enumerate(torch.split(hidden_states, sizes, dim=0))]
+            engine._vision_peak_gb = torch.cuda.max_memory_allocated(dev) / 2**30
+            first = outs[0]
+            first.last_hidden_state = torch.cat([o.last_hidden_state for o in outs], dim=0)
+            first.pooler_output = torch.cat([o.pooler_output for o in outs], dim=0)
+            first.deepstack_features = [torch.cat([o.deepstack_features[j] for o in outs], dim=0)
+                                        for j in range(len(first.deepstack_features))]
+            return first
+
+        visual.forward = forward
 
     def _route_text_encoder(self, te) -> None:
         """te.model.forward を包み、入力を TE 側 GPU へ、hidden_states[50] だけをホスト経由で返す。"""
@@ -621,8 +677,10 @@ class Engine:
         elapsed = time.time() - t0
         if ctx and "t_first_step" in ctx:
             # どこに時間が掛かっているかを見るための内訳(RAM の少ない PC では text_encoder がディスク律速になる)
-            logger.info("phases: text_encoder+prep %.1fs, denoise %.1fs (%d steps), vae decode %.1fs, total %.1fs",
-                        ctx["t_first_step"] - t0, ctx["t_last_step"] - ctx["t_first_step"], steps,
+            logger.info("phases: text_encoder+prep %.1fs (TE peak %.2fGB, vision %.2fGB), denoise %.1fs (%d steps), "
+                        "vae decode %.1fs, total %.1fs",
+                        ctx["t_first_step"] - t0, self._te_peak_gb, self._vision_peak_gb,
+                        ctx["t_last_step"] - ctx["t_first_step"], steps,
                         t0 + elapsed - ctx["t_last_step"], elapsed)
         stats = {
             "generation_seconds": round(elapsed, 2),

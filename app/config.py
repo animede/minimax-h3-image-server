@@ -61,6 +61,9 @@ class Settings:
     # 正方形 1024² の数倍になり、8gb / 16gb 構成では TE や denoise で OOM する(実測)。この上限を超える参照は縮小し、
     # 上限以下の小さい画像は拡大しない。auto = 8gb / 16gb 構成なら 105(≒1024²)、それ以外は本家どおり(上限なし)
     reference_max_megapixels: str = _env("H3IMG_REFERENCE_MAX_MEGAPIXELS", "auto")
+    # 1 にすると text_encoder のビジョン塔(ViT)を参照画像 1 枚ずつ通す(中間テンソルが最大 1 枚分で済む)。
+    # 結果は一括処理と数値的に同一ではない(bf16 の計算順序の差が拡散で増幅され、画像で平均 3/255 程度)ので既定は 0
+    vision_per_image: bool = _env("H3IMG_VISION_PER_IMAGE", "0") == "1"
     models_dir: Path = Path(_env("H3IMG_MODELS_DIR", str(BASE_DIR / "models")))
     # 使う GPU: H3IMG_GPU=1 のように番号で指定(H3IMG_DEVICE=cuda:1 と同じ)。TE は H3IMG_TE_GPU / H3IMG_TE_DEVICE。
     # 既定: transformer は cuda:0、TE は GPU が 2 枚以上あれば cuda:1(engine 側で解決)
