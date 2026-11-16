@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -62,7 +63,7 @@ def quantize_tensors(src_dir: Path, n_layers: int, device: torch.device, linear_
                     del p
                 else:
                     # Detach retained tensors from the source mapping before deleting it on Windows.
-                    out = {key: t.to(dtype=torch.bfloat16, copy=True).contiguous()}
+                    out = {key: t.to(dtype=torch.bfloat16, copy=sys.platform == "win32").contiguous()}
                 del t
                 yield key, out
         if source is not None:
