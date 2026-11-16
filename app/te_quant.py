@@ -61,7 +61,9 @@ def quantize_tensors(src_dir: Path, n_layers: int, device: torch.device, linear_
                         out[f"{key}.{k}"] = v.cpu()
                     del p
                 else:
-                    out = {key: t.to(torch.bfloat16).contiguous()}
+                    # Detach retained tensors from the source mapping before deleting it on Windows.
+                    out = {key: t.to(dtype=torch.bfloat16, copy=True).contiguous()}
+                del t
                 yield key, out
         if source is not None:
             source.release(shard)
