@@ -28,6 +28,42 @@ _LAYER_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.")
 _REST_SHARD_MAX_BYTES = 2 << 30     # 層以外(埋め込み表・視覚塔・lm_head)は 2GB ごとに分ける
 
 
+def _windows_filesystem(path: Path) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    volume_path = kernel32.GetVolumePathNameW
+    volume_path.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    volume_path.restype = wintypes.BOOL
+    volume_info = kernel32.GetVolumeInformationW
+    volume_info.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
+                           ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                           ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR, wintypes.DWORD]
+    volume_info.restype = wintypes.BOOL
+    root = ctypes.create_unicode_buffer(32768)
+    # Resolve links before inspecting the volume containing the actual shard.
+    if not volume_path(str(path.resolve(strict=True)), root, len(root)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    filesystem = ctypes.create_unicode_buffer(256)
+    if not volume_info(root.value, None, 0, None, None, None, filesystem, len(filesystem)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return filesystem.value
+
+
+def _requires_source_copy(path: Path) -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        filesystem = _windows_filesystem(path)
+        if not filesystem:
+            raise OSError("Empty filesystem name")
+        return filesystem.casefold() == "exfat"
+    except OSError as exc:
+        logger.warning("Cannot determine filesystem for %s; copying retained tensors: %s", path, exc)
+        return True
+
+
 def _shard_name(key: str, n_layers: int) -> str:
     m = _LAYER_RE.match(key)
     if m:
@@ -51,6 +87,7 @@ def quantize_tensors(src_dir: Path, n_layers: int, device: torch.device, linear_
             by_shard.setdefault(shard, []).append(key)
     for shard in sorted(by_shard):
         path = source.fetch(shard) if source is not None else src_dir / shard
+        copy_retained = _requires_source_copy(path)
         with safe_open(str(path), framework="pt", device="cpu") as f:
             for key in by_shard[shard]:
                 t = f.get_tensor(key)
@@ -62,8 +99,8 @@ def quantize_tensors(src_dir: Path, n_layers: int, device: torch.device, linear_
                         out[f"{key}.{k}"] = v.cpu()
                     del p
                 else:
-                    # Detach retained tensors from the source mapping before deleting it on Windows.
-                    out = {key: t.to(dtype=torch.bfloat16, copy=sys.platform == "win32").contiguous()}
+                    # Detach retained tensors where the mapped shard cannot be deleted.
+                    out = {key: t.to(dtype=torch.bfloat16, copy=copy_retained).contiguous()}
                 del t
                 yield key, out
         if source is not None:
