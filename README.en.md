@@ -138,7 +138,8 @@ see method 6 [below](#how-the-vram-was-reduced-and-the-speed-increased)).
 ### Steps
 
 ```bash
-git clone <this repo> minimax-h3-image-server && cd minimax-h3-image-server
+git clone https://github.com/animede/minimax-h3-image-server.git
+cd minimax-h3-image-server
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 # without uv: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
@@ -170,33 +171,43 @@ profile (W4A8, TE and transformer both `file`) is selected automatically; 1024²
 13GB text encoder from disk is ~10 s (1.3GB/s). Output matches Linux in content (not pixel-identical, different GPU
 arithmetic). Write prompts in English (Japanese prompts may be ignored; the UI's "enhance" button converts them).
 
-With uv (install it with `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"` and
-reopen PowerShell afterwards):
+Requirements: git, Python 3.12 and an NVIDIA driver supporting CUDA 13. If git or Python is missing, install them with winget and reopen PowerShell (on Windows 10, `--source winget` avoids a hang on the Store source):
 
 ```powershell
-git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
-uv venv --python 3.12 .venv
-uv pip install --python .venv\Scripts\python.exe -r requirements-windows.txt
-.venv\Scripts\python.exe scripts\prepare_models.py     # prepare the models (needs a GPU, <1GB of VRAM)
-.\run.ps1                                                                 # http://127.0.0.1:8633/
+winget install --id Git.Git -e --source winget
+winget install --id Python.Python.3.12 -e --source winget
 ```
 
-Without uv (the standard venv + pip work the same, as long as Python 3.12 is installed):
+With the standard venv + pip (one command per line):
 
 ```powershell
-git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
-py -3.12 -m venv .venv                      # or python -m venv .venv if `py` is unavailable (must be 3.12)
+git clone https://github.com/animede/minimax-h3-image-server.git
+cd minimax-h3-image-server
+py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install --upgrade pip
 .venv\Scripts\python.exe -m pip install -r requirements-windows.txt
 .venv\Scripts\python.exe scripts\prepare_models.py
-.\run.ps1
+.\run.bat
 ```
+
+With uv (install it with `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"` and reopen PowerShell afterwards):
+
+```powershell
+git clone https://github.com/animede/minimax-h3-image-server.git
+cd minimax-h3-image-server
+uv venv --python 3.12 .venv
+uv pip install --python .venv\Scripts\python.exe -r requirements-windows.txt
+.venv\Scripts\python.exe scripts\prepare_models.py
+.\run.bat
+```
+
+`scripts\prepare_models.py` prepares the models (needs a GPU, under 1GB of VRAM). `run.bat` starts `run.ps1` regardless of the PowerShell execution policy and listens on `http://127.0.0.1:8633/`.
 
 - An NVIDIA driver supporting CUDA 13 is required.
 - On PCs with little RAM the weights are streamed with the `file` method on both Linux and Windows (read directly from
   the file, no page cache). The `mmap` method (page cache + `madvise`) is Linux-only.
-- If PowerShell refuses to run `.\run.ps1` because of the execution policy, start it with
-  `powershell -ExecutionPolicy Bypass -File .\run.ps1`.
+- If running `.\run.ps1` directly is blocked by the execution policy, use `run.bat` or start it with `powershell -ExecutionPolicy Bypass -File .\run.ps1`.
+- On Windows the Hugging Face cache is set not to use symlinks (`HF_HUB_DISABLE_SYMLINKS=1`) automatically, to avoid a huggingface_hub race that aborts parallel downloads with `WinError 1314` on PCs without Developer Mode (disk usage is unchanged). Only the `--link-te` style symlink references need Developer Mode or an administrator shell.
 - If your torch build does not support `expandable_segments`, it only warns and continues.
 
 ### Hugging Face access

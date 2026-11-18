@@ -129,7 +129,8 @@ int8wo と同程度です。品質は同一 seed で int8wo と並べて目視�
 ### 手順
 
 ```bash
-git clone <this repo> minimax-h3-image-server && cd minimax-h3-image-server
+git clone https://github.com/animede/minimax-h3-image-server.git
+cd minimax-h3-image-server
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 # uv を使わない場合: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
@@ -160,33 +161,43 @@ uv pip install --python .venv/bin/python -r requirements.txt
 約 10 秒 = 1.3GB/s)。出力は Linux と同じ内容(演算が違うのでピクセル一致はしません)。
 プロンプトは英語で書いてください(日本語のままだと内容が反映されないことがあります。UI の「拡張」で英語に変換できます)。
 
-uv を使う場合(uv は `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"` で入ります。
-インストール後は PowerShell を開き直してください):
+必要なもの: git、Python 3.12、CUDA 13 系に対応した NVIDIA ドライバ。git と Python が無ければ winget で入れ、そのあと PowerShell を開き直します(Windows 10 では `--source winget` が無いとストアのソースで止まることがあります):
 
 ```powershell
-git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
-uv venv --python 3.12 .venv
-uv pip install --python .venv\Scripts\python.exe -r requirements-windows.txt
-.venv\Scripts\python.exe scripts\prepare_models.py     # モデルの準備(GPU が必要、VRAM は 1GB 未満)
-.\run.ps1                                                                 # http://127.0.0.1:8633/
+winget install --id Git.Git -e --source winget
+winget install --id Python.Python.3.12 -e --source winget
 ```
 
-uv を使わない場合(Python 3.12 が入っていれば標準の venv + pip で同じことができます):
+標準の venv + pip の場合(1 行ずつ実行):
 
 ```powershell
-git clone <this repo> minimax-h3-image-server; cd minimax-h3-image-server
-py -3.12 -m venv .venv                      # py が無ければ python -m venv .venv(3.12 系であること)
+git clone https://github.com/animede/minimax-h3-image-server.git
+cd minimax-h3-image-server
+py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install --upgrade pip
 .venv\Scripts\python.exe -m pip install -r requirements-windows.txt
 .venv\Scripts\python.exe scripts\prepare_models.py
-.\run.ps1
+.\run.bat
 ```
+
+uv を使う場合(uv は `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"` で入ります。インストール後は PowerShell を開き直してください):
+
+```powershell
+git clone https://github.com/animede/minimax-h3-image-server.git
+cd minimax-h3-image-server
+uv venv --python 3.12 .venv
+uv pip install --python .venv\Scripts\python.exe -r requirements-windows.txt
+.venv\Scripts\python.exe scripts\prepare_models.py
+.\run.bat
+```
+
+`scripts\prepare_models.py` はモデルの準備(GPU が必要、VRAM は 1GB 未満)。`run.bat` は PowerShell の実行ポリシーに関係なく `run.ps1` を起動し、`http://127.0.0.1:8633/` で待ち受けます。
 
 - CUDA 13 系に対応した NVIDIA ドライバが必要です。
 - RAM の少ない PC 向けの原本の置き場所は、Linux / Windows とも既定で `file`(ファイルから直接読む)です。
   `mmap`(ページキャッシュ + `madvise`)は Linux 専用で、Windows では使い終わった層の破棄が効きません。
-- PowerShell で `.\run.ps1` がスクリプトの実行ポリシーで止まる場合は
-  `powershell -ExecutionPolicy Bypass -File .\run.ps1` で起動してください。
+- `.\run.ps1` を直接実行して実行ポリシーで止まる場合は `run.bat` を使うか、`powershell -ExecutionPolicy Bypass -File .\run.ps1` で起動してください。
+- Hugging Face のキャッシュは Windows では symlink を使わない設定(`HF_HUB_DISABLE_SYMLINKS=1`)を自動で入れます(開発者モードが OFF の PC で並列ダウンロード中に `WinError 1314` で止まる huggingface_hub の競合を避けるため。ディスク使用量は変わりません)。`--link-te` などの symlink 参照だけは開発者モードか管理者権限が要ります。
 - `expandable_segments` が非対応の torch では警告が出るだけで動作します。
 
 ### Hugging Face へのアクセス

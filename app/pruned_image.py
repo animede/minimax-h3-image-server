@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import functools
+import gc
 import json
 import logging
 import math
@@ -808,7 +809,11 @@ def _load_state(cache_dir: Path) -> dict:
         t0 = time.time()
         out = _save_state(sd, cache_dir)
         del sd
-        pt.unlink()
+        gc.collect()      # torch.load(mmap=True) の参照を手放してから消す(Windows はマップ中のファイルを消せない)
+        try:
+            pt.unlink()
+        except PermissionError:
+            logger.warning("old cache %s is still mapped and was not removed; delete it by hand later", pt)
         logger.info("cache converted to safetensors: %s (%.0fs, old .pt removed)", out, time.time() - t0)
         from safetensors.torch import load_file
         return load_file(str(out), device="cpu")
@@ -883,7 +888,6 @@ def load_transformer(repo: str, pipe, device: torch.device, cache_dir: Path, qua
     # ビルドしたモデルはそのまま使わず、保存したキャッシュから読み直す(初回と 2 回目以降で同じ経路にする。
     # ビルド中に差し込んだストリーミングの hook は spill 前のテンソルを指していて、そのままでは使えない)
     del tr
-    import gc
     gc.collect()
     release_pinned("transformer")
     release_file_streamers("transformer")

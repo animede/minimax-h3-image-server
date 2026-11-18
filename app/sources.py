@@ -37,9 +37,23 @@ class ShardSource:
             return
         real = Path(os.path.realpath(p))
         size = real.stat().st_size if real.exists() else 0
+        # Windows は mmap がまだ生きている(読んだテンソルの参照が GC されていない)ファイルを消せず
+        # PermissionError(WinError 5)になる。GC して少し待って数回やり直し、それでも消せなければ残して続ける
+        # (ディスクがシャード 1 つ分増えるだけで、構築は完走する)。
+        import gc
+        import time
+
         for q in (p, real):
-            try:
-                q.unlink()
-            except FileNotFoundError:
-                pass
+            for attempt in range(6):
+                try:
+                    q.unlink()
+                    break
+                except FileNotFoundError:
+                    break
+                except PermissionError:
+                    if attempt == 5:
+                        logger.warning("could not remove %s (still mapped or open elsewhere); leaving it in place", q)
+                        return
+                    gc.collect()
+                    time.sleep(1.0 + attempt)
         logger.info("removed %s (%.1fGB freed)", shard, size / 2**30)

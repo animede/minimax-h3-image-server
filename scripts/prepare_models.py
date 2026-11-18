@@ -57,7 +57,15 @@ def _link(target: Path, link: Path) -> None:
             return
         raise SystemExit(f"{link} が既に存在します。手で整理してから再実行してください")
     link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(target.resolve())
+    try:
+        link.symlink_to(target.resolve())
+    except OSError as exc:
+        if sys.platform == "win32":
+            raise SystemExit(
+                f"symlink を作れません({exc})。Windows では開発者モードを ON にするか管理者で実行するか、"
+                f"--link-* を使わずに {target} を {link} へコピー(または mklink /J のジャンクション)してください"
+            ) from exc
+        raise
     log(f"symlink: {link} -> {target}")
 
 
