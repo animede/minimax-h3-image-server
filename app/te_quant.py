@@ -31,9 +31,10 @@ _REST_SHARD_MAX_BYTES = 2 << 30     # 層以外(埋め込み表・視覚塔・lm
 def _requires_source_copy(path: Path) -> bool:
     """保持するテンソルを元シャードの mmap から切り離す(複製する)か。Windows では常に True。
 
-    Windows は mmap 中のファイルを削除できない(exFAT だけでなく NTFS でも WinError 5 になる。Diffusers_minimax-h3 の
-    Windows 10 の C: ドライブで実測)。複製するのは bf16 のまま保持する非線形層(埋め込み表など)だけで、コストは小さい。
-    PR #1(shiena)の対処を exFAT 限定から Windows 全体に広げたもの。Linux / macOS では mmap 中でも削除できるので複製しない。"""
+    mmap 中のファイルを削除できるかは Windows の版とファイルシステムで変わる: PR #1(shiena)の検証では exFAT で失敗し
+    NTFS では成功、Diffusers_minimax-h3 の別の Windows 10 機では C: ドライブ(NTFS)でも WinError 5 で失敗した。環境ごとに
+    判定するより、複製(bf16 のまま保持する非線形層だけ、コストは小さい)を Windows では常に行うほうが確実なので、
+    PR #1 の exFAT 判定を外して Windows 全体に広げた。Linux / macOS では mmap 中でも削除できるので複製しない。"""
     return sys.platform == "win32"
 
 
